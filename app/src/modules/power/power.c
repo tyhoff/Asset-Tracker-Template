@@ -78,6 +78,56 @@ BUILD_ASSERT(CONFIG_APP_POWER_WATCHDOG_TIMEOUT_SECONDS >
 	     CONFIG_APP_POWER_MSG_PROCESSING_TIMEOUT_SECONDS,
 	     "Watchdog timeout must be greater than maximum message processing time");
 
+/* No-init RAM section for fuel gauge state that persists across reboots */
+struct fuel_gauge_noinit_data {
+	uint32_t magic; /* Magic number to validate state */
+	uint32_t size;  /* Size of state data */
+	uint8_t state[256]; /* Fuel gauge state buffer */
+} __attribute__((section(".noinit")));
+
+#define FUEL_GAUGE_MAGIC 0x4647534F /* "FGSO" - Fuel Gauge State OK */
+
+static struct fuel_gauge_noinit_data fuel_gauge_noinit;
+
+static int fuel_gauge_state_save(void)
+{
+	int err;
+	size_t state_size = nrf_fuel_gauge_state_size;
+
+	if (state_size > sizeof(fuel_gauge_noinit.state)) {
+		LOG_ERR("Fuel gauge state size too large: %zu", state_size);
+		return -ENOMEM;
+	}
+
+	err = nrf_fuel_gauge_state_get(fuel_gauge_noinit.state, state_size);
+	if (err) {
+		LOG_ERR("nrf_fuel_gauge_state_get failed: %d", err);
+		return err;
+	}
+
+	fuel_gauge_noinit.size = state_size;
+	fuel_gauge_noinit.magic = FUEL_GAUGE_MAGIC;
+
+	LOG_DBG("Saved fuel gauge state to no-init RAM (%zu bytes)", state_size);
+	return 0;
+}
+
+static bool fuel_gauge_state_is_valid(void)
+{
+	if (fuel_gauge_noinit.magic != FUEL_GAUGE_MAGIC) {
+		LOG_INF("No valid fuel gauge state found (magic: 0x%08x)",
+			fuel_gauge_noinit.magic);
+		return false;
+	}
+
+	if (fuel_gauge_noinit.size == 0 || fuel_gauge_noinit.size > sizeof(fuel_gauge_noinit.state)) {
+		LOG_WRN("Invalid fuel gauge state size: %u", fuel_gauge_noinit.size);
+		return false;
+	}
+
+	return true;
+}
+
 /* nPM13xx register bitmasks */
 
 /* CHARGER.BCHGCHARGESTATUS.TRICKLECHARGE */
@@ -229,6 +279,16 @@ static void state_running_entry(void *obj)
 		LOG_ERR("charger_read_sensors, error: %d", err);
 		SEND_FATAL_ERROR();
 		return;
+	}
+
+	/* Load fuel gauge state from no-init RAM if available */
+	if (fuel_gauge_state_is_valid()) {
+		LOG_INF("Restoring fuel gauge from saved state (%u bytes)",
+			fuel_gauge_noinit.size);
+		parameters.state = fuel_gauge_noinit.state;
+	} else {
+		LOG_INF("No saved fuel gauge state found, initializing from scratch");
+		parameters.state = NULL;
 	}
 
 	err = nrf_fuel_gauge_init(&parameters, NULL);
@@ -514,6 +574,12 @@ static void sample(int64_t *ref_time)
 				  NPM13XX_CHG_STATUS_CV_MASK)) != 0;
 
 	state_of_charge = nrf_fuel_gauge_process(voltage, current, temp, delta, NULL);
+
+	/* Save fuel gauge state to no-init RAM after each query */
+	err = fuel_gauge_state_save();
+	if (err) {
+		LOG_WRN("Failed to save fuel gauge state: %d", err);
+	}
 #endif /* CONFIG_MEMFAULT_NRF_PLATFORM_BATTERY_NPM13XX */
 
 	LOG_DBG("State of charge: %f", (double)roundf(state_of_charge));
