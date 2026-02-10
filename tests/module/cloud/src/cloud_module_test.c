@@ -94,6 +94,7 @@ FAKE_VALUE_FUNC(int, nrf_cloud_client_id_get, char *, size_t);
 FAKE_VALUE_FUNC(int, nrf_cloud_coap_init);
 FAKE_VALUE_FUNC(int, nrf_cloud_coap_connect, const char * const);
 FAKE_VALUE_FUNC(int, nrf_cloud_coap_disconnect);
+FAKE_VALUE_FUNC(int, nrf_cloud_coap_shadow_network_info_update);
 FAKE_VALUE_FUNC(int, nrf_cloud_coap_shadow_device_status_update);
 FAKE_VALUE_FUNC(int, nrf_cloud_coap_bytes_send, uint8_t *, size_t, bool);
 FAKE_VALUE_FUNC(int, nrf_cloud_coap_sensor_send, const char *, double, int64_t, bool);

@@ -449,6 +449,17 @@ static void handle_network_data_message(const struct network_msg *msg)
 	if (err) {
 		LOG_ERR("nrf_cloud_coap_sensor_send, error: %d", err);
 		send_request_failed();
+
+		return;
+	}
+
+	/* Update shadow with current network info (band, cell ID, IP, etc.) */
+	err = nrf_cloud_coap_shadow_network_info_update();
+	if (err) {
+		LOG_ERR("nrf_cloud_coap_shadow_network_info_update, error: %d", err);
+		send_request_failed();
+
+		return;
 	}
 }
 
