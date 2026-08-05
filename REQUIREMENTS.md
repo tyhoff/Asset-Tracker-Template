@@ -30,6 +30,39 @@ conversion to other formats happen off-device, on hosts or servers, from the exp
    scripts convert to whatever a consumer needs. But it **must carry a schema version** so future
    readers know how to interpret and migrate it.
 
+---
+
+## Development environment
+
+The repository is **not** a west workspace on its own. The SDK lives in a sibling workspace so this
+repo never moves:
+
+| Thing | Value |
+|---|---|
+| NCS version | **v3.4.0** (matches the `nrf` revision pinned in `west.yml`) |
+| Toolchain | installed via `nrfutil toolchain-manager install --ncs-version v3.4.0` |
+| SDK workspace | `/Users/tyler/junk/ncs-3.4.0` (follows the existing `ncs-<version>` convention) |
+| Board target | `thingy91x/nrf9151/ns` |
+
+Note: macOS is case-insensitive, so the workspace name `asset-tracker-template` used in
+`docs/common/getting_started.md` collides with this repo's own directory name. Hence the
+`ncs-3.4.0` sibling layout and out-of-tree app builds.
+
+Clone the SDK shallow — it is vastly faster and sufficient for building:
+
+```shell
+west init -m https://github.com/nrfconnect/sdk-nrf --mr v3.4.0 /Users/tyler/junk/ncs-3.4.0
+cd /Users/tyler/junk/ncs-3.4.0 && west update --narrow -o=--depth=1
+```
+
+Build (out-of-tree app, from inside the SDK workspace):
+
+```shell
+cd /Users/tyler/junk/ncs-3.4.0
+nrfutil toolchain-manager launch --ncs-version v3.4.0 -- \
+  west build -b thingy91x/nrf9151/ns --sysbuild /Users/tyler/junk/Asset-Tracker-Template/app
+```
+
 ### Capture priority (from stakeholder)
 
 1. **Wi-Fi APs** — highest value; most customers rely on Wi-Fi, not multi-cell.
@@ -297,31 +330,98 @@ local file or simple local server is fine):
 
 ---
 
-## Verification
+## Verification strategy
 
-Build and flash:
-```
-west build -b thingy91x/nrf9151/ns app --pristine
-west flash
-```
+The overriding constraint: **no checkpoint may depend on a later checkpoint to prove it works.**
+Hardware is not currently available to the author, so every checkpoint must be provable on the host,
+and must additionally ship the on-target command that will prove it once hardware is in hand.
 
-1. **Unit — encoder.** CBOR round-trip: encode a synthetic record, decode, assert field equality
-   and that absent fields are genuinely absent (not zero). Add to the existing Twister `tests/`.
-2. **Measure real record size** with 10 APs and 10 neighbors, both profiles. Update the FW-6
-   capacity table with measured numbers.
-3. **Unit — converter.** Golden-file test: fixed input → expected output. Assert version dispatch,
-   omitted-vs-zero handling, neighbor/identified-cell separation, and interpolation maths.
-4. **Bench, stationary at a surveyed point.** Validate the whole chain before driving: GNSS
-   accuracy sane; Wi-Fi MACs/channels/frequencies correct (cross-check against an independent
-   scan); serving cell matches the network; DEEP returns multiple full-identity GCI cells.
-5. **Timing characterisation.** Log real durations for hot GNSS, light cell measurement, GCI
-   search, and Wi-Fi scan. These set the actual interpolation error budget — measure, don't rely on
-   the estimates in FW-4.
-6. **Storage soak.** Run to partition-full; confirm the configured full-behaviour, no corruption,
-   and that an export after power-cycle returns every record. Verify export resumability by
-   interrupting mid-transfer.
-7. **Drive test.** Short loop with overlapping passes; confirm repeat visits to the same place
-   produce consistent observations, and that timestamps and interpolation behave under real motion.
+### Existing frameworks (use these — do not invent new ones)
+
+Reconnaissance confirmed three usable layers already in the repo:
+
+| Layer | Location | Runs on | Use for |
+|---|---|---|---|
+| Unit tests | `tests/module/<module>/` | **`native_sim`** — host, no hardware | logic, state machines, encode/decode |
+| Shared test scaffolding | `tests/common/` | `native_sim` | common harness |
+| Hardware-in-the-loop | `tests/on_target/tests/` (pytest: `test_functional`, `test_gnss`, `test_ppk`, `test_provisioning`) | real device | end-to-end, deferred until hardware |
+
+Unit tests use **Twister + ztest/Unity + FFF fakes** (`zephyr/fff.h`, `DEFINE_FFF_GLOBALS`,
+`FAKE_VALUE_FUNC`), mocking the Location library, `task_wdt`, `date_time`, and `lte_lc` — see
+`tests/module/location/` for the pattern to copy. `CONFIG_SHELL=y` is already set in
+`app/prj.conf:82`, so shell commands are available as a first-class debugging surface.
+
+### Rules for every checkpoint (non-negotiable)
+
+1. **It builds.** `west build -b thingy91x/nrf9151/ns --sysbuild` succeeds. A checkpoint that does
+   not build is not a checkpoint.
+2. **It is flashable and boots.** Never leave the device in a state that fails to boot or hangs a
+   module thread. The task watchdog must stay satisfied.
+3. **It does not regress the template.** New behaviour lives behind **`CONFIG_APP_SURVEY`**,
+   defaulting to `n` until the feature is complete. Existing asset-tracker behaviour must remain
+   intact and testable at every commit. This is what guarantees flashability.
+4. **Existing tests still pass.** `west twister -T tests/module --platform native_sim`.
+5. **It carries its own proof** — at least one of:
+   - a `native_sim` unit test asserting the new behaviour, **and/or**
+   - a shell command that lets a human observe the behaviour directly on hardware.
+6. **Commits are small and single-purpose.** One checkpoint per commit, message stating what is now
+   provable and how to prove it.
+
+### Observability first
+
+Build the debugging surface **before** the features that need it, so nothing is ever a black box.
+A `survey` shell command group is checkpoint CP1 — ahead of all data-format and storage work:
+
+| Command | Purpose |
+|---|---|
+| `survey scan` | trigger one capture now, synchronously |
+| `survey show [n]` | pretty-print the last (or nth) observation: every cell, every AP, every timestamp |
+| `survey hex [n]` | hexdump the encoded CBOR record — proves the encoder without a host |
+| `survey stats` | record count, bytes used, free space, dropped counters |
+| `survey timing` | last measured durations for GNSS / cell / Wi-Fi steps |
+| `survey profile <fast\|deep>` | force a profile, bypassing the gating logic |
+| `survey selftest` | encode → decode → compare in place on device; prints PASS/FAIL |
+
+Verbose per-step logging behind a Kconfig log level, so a field failure can be diagnosed from a
+serial capture alone.
+
+### Checkpoints
+
+Each row states what lands, how it is proven **without hardware**, and how it will be proven **on
+hardware**. `native_sim` proofs are the gate for merging; on-target proofs are run later in one pass.
+
+| # | Lands | Host proof (no hardware) | On-target proof |
+|---|---|---|---|
+| **CP0** | Environment + baseline. No functional change. | Baseline app builds for `thingy91x/nrf9151/ns`; `west twister -T tests/module` green. Record the baseline flash/RAM figures. | Flash unmodified app, confirm it boots |
+| **CP1** | `survey` shell group + `CONFIG_APP_SURVEY`; `show` prints observations from the **existing** pipeline (no new fields yet) | Unit test: shell command handlers invoked, formatting correct against a synthetic observation | `survey scan` then `survey show` prints real cells + APs |
+| **CP2** | FW-1 struct fields: `channel`/`frequency`/`band` on Wi-Fi, `phys_cell_id` on cells; plumbed through `location.c` and `cloud_location.c` | Unit test in `tests/module/location/`: inject a fake Location event with known channel/freq/PCI, assert they survive onto the zbus message | `survey show` now displays channel/freq/band/PCI; cross-check against an independent Wi-Fi scan |
+| **CP3** | FW-5 CBOR encoder + CDDL + `version` field | Unit test: encode → decode round-trip; assert absent fields are **absent, not zero**; assert size ≤ 700 B with 10 APs + 10 neighbors and **record the measured size** | `survey hex` + `survey selftest` prints PASS |
+| **CP4** | HOST-1 decoder (reads CP3 output) | Golden-file test: fixture CBOR → expected JSON. Feed it the exact bytes from CP3's unit test so encoder and decoder are proven against each other | Decode a real `survey hex` dump from the device |
+| **CP5** | FW-6 storage: new record type, LittleFS backend, grown partition | Unit test: store N records, read back, assert count and content. Assert configured full-behaviour at capacity | `survey stats`; store records, power-cycle, confirm count survives |
+| **CP6** | FW-2/FW-4 paired capture orchestrator: GNSS bracket + scan, all six timestamps | Unit test with faked Location library: assert request **sequence** (GNSS → scan → GNSS), assert no overlap, assert all timestamps populated and ordered | `survey scan` then `survey show` shows two GNSS fixes bracketing the scan; `survey timing` reports real durations |
+| **CP7** | FW-2 profiles FAST/DEEP + gating | Unit test: gating decisions across a speed/power truth table; assert DEEP requests GCI | `survey profile deep` yields multiple full-identity GCI cells; FAST does not |
+| **CP8** | FW-8 export protocol over USB CDC | Unit test: framing, length prefix, checksum, resume-from-sequence | Export to host, verify checksums, interrupt mid-transfer and confirm resume is lossless and non-destructive |
+| **CP9** | HOST-2 Web Serial page | Manual: point it at a recorded dump/fixture stream | Full export from device via browser |
+| **CP10** | FW-7 cadence, FW-9 LEDs, FW-10 hygiene | Unit test: timer reschedule maths; assert ground-fix is never called | Headless cold-boot run; LED states legible; storage-full behaviour correct |
+
+**Note on CP8:** USB on Thingy:91 X routes through the nRF5340 connectivity bridge, not the
+nRF9151. That cannot be fully validated on the host. Prove the *protocol* over the existing serial
+shell first (which is transport-agnostic), so only the physical transport remains unproven — this
+keeps the risk contained to one checkpoint instead of blocking the project.
+
+### Final validation (requires hardware)
+
+1. **Bench, stationary at a surveyed point.** GNSS accuracy sane; Wi-Fi MACs/channels/frequencies
+   correct against an independent scan; serving cell matches the network; DEEP returns multiple
+   full-identity GCI cells.
+2. **Timing characterisation.** Real durations for hot GNSS, light cell measurement, GCI search,
+   Wi-Fi scan — via `survey timing`. These set the actual interpolation error budget; measure rather
+   than trusting the estimates in FW-4.
+3. **Storage soak.** Run to partition-full; confirm full-behaviour, no corruption, and that export
+   after power-cycle returns every record.
+4. **Drive test.** Short loop with overlapping passes; confirm repeat visits produce consistent
+   observations and that interpolation behaves under real motion.
+5. Add a `survey` suite under `tests/on_target/tests/` once the above passes manually.
 
 ## Risks
 
@@ -333,13 +433,19 @@ west flash
 | 10-AP cap truncates dense urban scans | Accepted; document it so analysis can account for it |
 | Format churn invalidates earlier datasets | Mandatory `version` field; freeze the schema before large collection campaigns |
 
-## Suggested build order
+## Build order
 
-FW-8 spike (verify USB export path) → FW-1 → FW-5 (encoder + CDDL) → FW-6 (storage) → FW-2
-(profiles) → FW-8 (full export) → HOST-1 → HOST-2 → FW-4/FW-7 tuning → FW-9/FW-10 →
-verification 4–7.
+Follow the checkpoints CP0 → CP10 in order. That ordering is deliberate:
+
+- **Observability precedes features** (CP1 before everything) so no later checkpoint is a black box.
+- **Encoder and decoder are adjacent** (CP3, CP4) and proven against each other's bytes, so the
+  schema-critical path is settled early and cheaply.
+- **Storage precedes the orchestrator** (CP5 before CP6) so captured records have somewhere durable
+  to land the moment pairing works.
+- **The riskiest transport work is last but pre-proven** (CP8) — the protocol is validated over the
+  existing serial shell, leaving only the physical USB path unverified.
 
 FW-3 requires no work — it exists only to record the decision not to pursue `adv`.
 
-FW-1, FW-5, and HOST-1 are the schema-critical path and should be reviewed together before
-anything is built on top of them.
+FW-1 (CP2), FW-5 (CP3), and HOST-1 (CP4) are the schema-critical path and should be reviewed
+together before anything is built on top of them.
