@@ -419,7 +419,7 @@ hardware**. `native_sim` proofs are the gate for merging; on-target proofs are r
 
 | # | Lands | Host proof (no hardware) | On-target proof |
 |---|---|---|---|
-| **CP0** | Environment + baseline + `scripts/run_unit_tests.sh`. No functional change. | Baseline app builds for `thingy91x/nrf9151/ns`; `scripts/run_unit_tests.sh` green. Baseline size recorded: **text 400,640 / data 155,473 / bss 190,982**. | Flash unmodified app, confirm it boots |
+| **CP0** ✅ | Environment + baseline + `scripts/run_unit_tests.sh`. No functional change. | **Done.** Baseline builds for `thingy91x/nrf9151/ns` (`merged.hex` produced); `scripts/run_unit_tests.sh` = **11/11 passed, 0 filtered**. Baseline size: **text 400,640 / data 155,473 / bss 190,982**. | Flash unmodified app, confirm it boots |
 | **CP1** | `survey` shell group + `CONFIG_APP_SURVEY`; `show` prints observations from the **existing** pipeline (no new fields yet) | Unit test: shell command handlers invoked, formatting correct against a synthetic observation | `survey scan` then `survey show` prints real cells + APs |
 | **CP2** | FW-1 struct fields: `channel`/`frequency`/`band` on Wi-Fi, `phys_cell_id` on cells; plumbed through `location.c` and `cloud_location.c` | Unit test in `tests/module/location/`: inject a fake Location event with known channel/freq/PCI, assert they survive onto the zbus message | `survey show` now displays channel/freq/band/PCI; cross-check against an independent Wi-Fi scan |
 | **CP3** | FW-5 CBOR encoder + CDDL + `version` field | Unit test: encode → decode round-trip; assert absent fields are **absent, not zero**; assert size ≤ 700 B with 10 APs + 10 neighbors and **record the measured size** | `survey hex` + `survey selftest` prints PASS |
