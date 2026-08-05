@@ -342,14 +342,41 @@ Reconnaissance confirmed three usable layers already in the repo:
 
 | Layer | Location | Runs on | Use for |
 |---|---|---|---|
-| Unit tests | `tests/module/<module>/` | **`native_sim`** — host, no hardware | logic, state machines, encode/decode |
-| Shared test scaffolding | `tests/common/` | `native_sim` | common harness |
+| Unit tests | `tests/module/<module>/` | **`native_sim`, inside Docker** (see below) | logic, state machines, encode/decode |
+| Shared test scaffolding | `tests/common/` | same | common harness |
 | Hardware-in-the-loop | `tests/on_target/tests/` (pytest: `test_functional`, `test_gnss`, `test_ppk`, `test_provisioning`) | real device | end-to-end, deferred until hardware |
 
 Unit tests use **Twister + ztest/Unity + FFF fakes** (`zephyr/fff.h`, `DEFINE_FFF_GLOBALS`,
 `FAKE_VALUE_FUNC`), mocking the Location library, `task_wdt`, `date_time`, and `lte_lc` — see
 `tests/module/location/` for the pattern to copy. `CONFIG_SHELL=y` is already set in
 `app/prj.conf:82`, so shell commands are available as a first-class debugging surface.
+
+#### Running unit tests on macOS
+
+**`native_sim` is Linux-only** — Zephyr's POSIX arch refuses to configure on macOS with
+*"The POSIX architecture only works on Linux."* Unit tests therefore run in a small Linux container:
+
+```shell
+scripts/run_unit_tests.sh                    # all module tests
+scripts/run_unit_tests.sh tests/module/location   # one suite
+scripts/run_unit_tests.sh --rebuild          # force image rebuild
+```
+
+The image (`tests/unit_docker/Dockerfile`) is deliberately **not** the ~20 GB x86 CI image: because
+`native_sim` builds with the *host* compiler, no Zephyr SDK is needed, so a slim Python 3.12 base
+runs natively on arm64. Hard-won details baked in, do not regress them:
+
+- **Python ≥ 3.12** — Zephyr 4.4 requires it; Debian bookworm ships 3.11.
+- **`ruby`** — required by NCS's `test_runner_generate` (Unity/CMock generators).
+- **`zcbor==0.9.1` + `cbor2==5.6.5`** — must match the zcbor bundled in NCS v3.4.0
+  (`modules/lib/zcbor`). Newer `cbor2` breaks zcbor with
+  `ImportError: cannot import name 'CBORDecodeValueError'`. `app/src/cbor/CMakeLists.txt:28` invokes
+  the `zcbor` CLI at configure time, so any suite that compiles the app fails without this.
+- **Platform must be `native_sim/native/64`** on arm64 hosts. Plain `native_sim` sets
+  `CONFIG_64BIT=n` and aborts with *"this Aarch64 machine has a 64-bit userspace"*.
+
+CI (`.github/workflows/sonarcloud.yml`) uses `ghcr.io/zephyrproject-rtos/ci` with plain
+`native_sim` on x86 Linux; the container above is the local equivalent, not a replacement.
 
 ### Rules for every checkpoint (non-negotiable)
 
@@ -360,7 +387,7 @@ Unit tests use **Twister + ztest/Unity + FFF fakes** (`zephyr/fff.h`, `DEFINE_FF
 3. **It does not regress the template.** New behaviour lives behind **`CONFIG_APP_SURVEY`**,
    defaulting to `n` until the feature is complete. Existing asset-tracker behaviour must remain
    intact and testable at every commit. This is what guarantees flashability.
-4. **Existing tests still pass.** `west twister -T tests/module --platform native_sim`.
+4. **Existing tests still pass.** `scripts/run_unit_tests.sh`.
 5. **It carries its own proof** — at least one of:
    - a `native_sim` unit test asserting the new behaviour, **and/or**
    - a shell command that lets a human observe the behaviour directly on hardware.
@@ -392,7 +419,7 @@ hardware**. `native_sim` proofs are the gate for merging; on-target proofs are r
 
 | # | Lands | Host proof (no hardware) | On-target proof |
 |---|---|---|---|
-| **CP0** | Environment + baseline. No functional change. | Baseline app builds for `thingy91x/nrf9151/ns`; `west twister -T tests/module` green. Record the baseline flash/RAM figures. | Flash unmodified app, confirm it boots |
+| **CP0** | Environment + baseline + `scripts/run_unit_tests.sh`. No functional change. | Baseline app builds for `thingy91x/nrf9151/ns`; `scripts/run_unit_tests.sh` green. Baseline size recorded: **text 400,640 / data 155,473 / bss 190,982**. | Flash unmodified app, confirm it boots |
 | **CP1** | `survey` shell group + `CONFIG_APP_SURVEY`; `show` prints observations from the **existing** pipeline (no new fields yet) | Unit test: shell command handlers invoked, formatting correct against a synthetic observation | `survey scan` then `survey show` prints real cells + APs |
 | **CP2** | FW-1 struct fields: `channel`/`frequency`/`band` on Wi-Fi, `phys_cell_id` on cells; plumbed through `location.c` and `cloud_location.c` | Unit test in `tests/module/location/`: inject a fake Location event with known channel/freq/PCI, assert they survive onto the zbus message | `survey show` now displays channel/freq/band/PCI; cross-check against an independent Wi-Fi scan |
 | **CP3** | FW-5 CBOR encoder + CDDL + `version` field | Unit test: encode → decode round-trip; assert absent fields are **absent, not zero**; assert size ≤ 700 B with 10 APs + 10 neighbors and **record the measured size** | `survey hex` + `survey selftest` prints PASS |
