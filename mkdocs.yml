@@ -96,6 +96,7 @@ nav:
     - Network: modules/network.md
     - Power: modules/power.md
     - Storage: modules/storage.md
+    - Survey: modules/survey.md
     - UART Power Control: modules/uart_power_control.md
   - Release artifacts: common/release.md
   - Release notes: common/release_notes.md

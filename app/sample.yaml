@@ -14,3 +14,14 @@ tests:
     tags:
       - ci_build
       - sysbuild
+  asset_tracker_template.app.survey:
+    sysbuild: true
+    build_only: true
+    extra_args: EXTRA_CONF_FILE="overlay-survey.conf"
+    integration_platforms:
+      - thingy91x/nrf9151/ns
+    platform_allow:
+      - thingy91x/nrf9151/ns
+    tags:
+      - ci_build
+      - sysbuild

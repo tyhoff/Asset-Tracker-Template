@@ -1,0 +1,35 @@
+# Copyright (c) 2026 Nordic Semiconductor
+#
+# SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+#
+
+menuconfig APP_SURVEY
+	bool "Radio survey"
+	depends on APP_LOCATION
+	depends on LOCATION_METHOD_GNSS
+	depends on LOCATION_METHOD_WIFI && LOCATION_METHOD_CELLULAR
+	select APP_LOCATION_SCAN_TRIGGER
+	select CBPRINTF_FP_SUPPORT
+	help
+	  Radio-survey data exporter. Captures GNSS fixes alongside the cell and
+	  Wi-Fi observations visible at the same moment, for off-device analysis of
+	  nRF Cloud Location Services accuracy.
+
+	  Default n: the survey feature is additive and must never change the
+	  behaviour of the asset-tracker application when disabled.
+
+if APP_SURVEY
+
+config APP_SURVEY_SHELL
+	bool "Survey shell commands"
+	depends on SHELL
+	default y
+	help
+	  Register the "survey" shell command group, used to inspect captured
+	  observations and to trigger captures manually from a console.
+
+module = APP_SURVEY
+module-str = Survey
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # APP_SURVEY

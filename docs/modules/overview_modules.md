@@ -20,3 +20,9 @@
 | [LED](led.md) | Controls an RGB LED for visual indication. |
 | [Power](power.md) | Monitors battery status and provides power management. |
 | [UART Power Control](uart_power_control.md) | UART suspend/resume on VBUS changes. |
+
+## Optional modules
+
+| Module | Description |
+|--------|-------------|
+| [Survey](survey.md) | Captures GNSS fixes alongside cell and Wi-Fi observations, for off-device analysis of location accuracy. Disabled by default. |

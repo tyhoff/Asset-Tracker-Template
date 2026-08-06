@@ -17,6 +17,7 @@ rsource "src/modules/fota/Kconfig.fota"
 rsource "src/modules/environmental/Kconfig.environmental"
 rsource "src/modules/button/Kconfig.button"
 rsource "src/modules/storage/Kconfig.storage"
+rsource "src/modules/survey/Kconfig.survey"
 rsource "memfault/Kconfig.memfault"
 
 endmenu
