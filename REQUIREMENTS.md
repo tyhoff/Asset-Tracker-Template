@@ -152,7 +152,11 @@ Requirements:
   detection. Check how VBUS/charger state is exposed in `app/src/modules/power/`; if it isn't,
   fall back to a shell/Kconfig toggle rather than blocking this work.
 - A shell command must force either profile on demand for bench testing.
-- **Do not use `LOCATION_SEARCH_CANCEL`** — `location.h` documents that it cannot truly cancel
+- **Do not use `LOCATION_SEARCH_CANCEL`.** Resolved in CP1: the template's own event handler fired
+  it after every cloud request. Scan-only requests now answer the library with
+  `location_cloud_location_ext_result_set(LOCATION_EXT_RESULT_UNKNOWN, NULL)` instead, which winds
+  the request down through the library's own state machine. The asset-tracker path is unchanged.
+  `location.h` documents that cancelling cannot truly cancel
   Wi-Fi scans and causes `-EBUSY` on subsequent requests.
 
 ### FW-3 — Timing advance (`adv`) — not a goal
@@ -188,6 +192,12 @@ better than extrapolating from a single fix. The residual limit is the scan's ow
 Wi-Fi scan at 70 mph smears across ~125 m); that is physics, so we **record it and report it as
 uncertainty** rather than hide it.
 
+**`alt`, `spd` and `hdg` need no new plumbing** (established in CP1). They are absent from
+`struct location_data`, but `CONFIG_LOCATION_DATA_DETAILS` — already selected by `Kconfig.location` —
+carries the full `nrf_modem_gnss_pvt_data_frame` alongside every fix, which has altitude, speed,
+heading and their accuracies plus satellite counts. Read them from
+`location_data.details.gnss.pvt_data`.
+
 Prefer modem GNSS time. Note that `location_msg.timestamp` falls back to **uptime** if the system
 clock was never synchronised — records must flag which time base was used so host tooling can
 reject unusable records.
@@ -204,6 +214,13 @@ definition alongside `device_shadow.cddl`.
   value for `rsrq`, `earfcn`, `pci`, `adv`, `frequency`, or `signalStrength`, and a stored zero is
   indistinguishable from a real measurement.
 - Store MAC addresses as 6-byte binary strings, not text.
+- **`rsrp` and `rsrq` are 3GPP index values, not dBm/dB** (established in CP1). `lte_lc` passes the
+  modem's raw indices through unconverted, while the ground-fix API expects dBm/dB — index 55 is
+  −86 dBm. Decide explicitly whether the record stores indices or converted values, state it in the
+  schema, and convert on exactly one side. Getting this wrong offsets every signal measurement in
+  the study by ~140. Conversion formulas: `RSRP_IDX_TO_DBM` / `RSRQ_IDX_TO_DB` in
+  `modem/modem_info.h`. Note index **0 means "not used"** for both, so it is an absent value, not a
+  measurement — as are `LTE_LC_CELL_RSRP_INVALID` / `..._RSRQ_INVALID` (both 255).
 - Timestamp compaction: one absolute epoch-ms base per record plus small deltas for the other five
   timestamps.
 - Record contents: version, sequence number, profile tag, time base flag, both GNSS fixes, all six
@@ -399,15 +416,21 @@ CI (`.github/workflows/sonarcloud.yml`) uses `ghcr.io/zephyrproject-rtos/ci` wit
 Build the debugging surface **before** the features that need it, so nothing is ever a black box.
 A `survey` shell command group is checkpoint CP1 — ahead of all data-format and storage work:
 
-| Command | Purpose |
-|---|---|
-| `survey scan` | trigger one capture now, synchronously |
-| `survey show [n]` | pretty-print the last (or nth) observation: every cell, every AP, every timestamp |
-| `survey hex [n]` | hexdump the encoded CBOR record — proves the encoder without a host |
-| `survey stats` | record count, bytes used, free space, dropped counters |
-| `survey timing` | last measured durations for GNSS / cell / Wi-Fi steps |
-| `survey profile <fast\|deep>` | force a profile, bypassing the gating logic |
-| `survey selftest` | encode → decode → compare in place on device; prints PASS/FAIL |
+| Command | Purpose | Lands in |
+|---|---|---|
+| `survey scan` | request a Wi-Fi + cellular scan (no GNSS) | CP1 ✅ |
+| `survey gnss` | request a GNSS-only fix | CP1 ✅ |
+| `survey show` | pretty-print the cached observation: every cell, every AP | CP1 ✅ |
+| `survey stats` | observation counters and cache age | CP1 ✅ |
+| `survey clear` | discard the cached observation | CP1 ✅ |
+| `survey selftest` | render a synthetic observation; needs no radio | CP1 ✅ |
+| `survey hex [n]` | hexdump the encoded CBOR record — proves the encoder without a host | CP3 |
+| `survey timing` | last measured durations for GNSS / cell / Wi-Fi steps | CP7 |
+| `survey profile <fast\|deep>` | force a profile, bypassing the gating logic | CP7 |
+
+`scan` and `gnss` are separate commands because the Location library treats its method list as a
+**fallback chain and stops at the first method that succeeds** — a request including GNSS returns a
+fix and never scans. This is the same reason FW-2 requires sequenced requests.
 
 Verbose per-step logging behind a Kconfig log level, so a field failure can be diagnosed from a
 serial capture alone.
@@ -420,7 +443,7 @@ hardware**. `native_sim` proofs are the gate for merging; on-target proofs are r
 | # | Lands | Host proof (no hardware) | On-target proof |
 |---|---|---|---|
 | **CP0** ✅ | Environment + baseline + `scripts/run_unit_tests.sh`. No functional change. | **Done.** Baseline builds for `thingy91x/nrf9151/ns` (`merged.hex` produced); `scripts/run_unit_tests.sh` = **11/11 passed, 0 filtered**. Baseline size: **text 400,640 / data 155,473 / bss 190,982**. | Flash unmodified app, confirm it boots |
-| **CP1** | `survey` shell group + `CONFIG_APP_SURVEY`; `show` prints observations from the **existing** pipeline (no new fields yet) | Unit test: shell command handlers invoked, formatting correct against a synthetic observation | `survey scan` then `survey show` prints real cells + APs |
+| **CP1** ✅ | `survey` shell group + `CONFIG_APP_SURVEY` (default n); `show` prints observations from the **existing** pipeline (no new fields yet). Adds `LOCATION_SCAN_SEARCH_TRIGGER` + `CONFIG_APP_LOCATION_SCAN_TRIGGER` to the location module. | **Done.** `tests/module/survey` = **29/29**; `tests/module/location` extended with 4 tests for the new trigger. Survey-off build **byte-identical to CP0** (text 400,640 / data 155,473 / bss 190,982); survey-on +2,276 text / +2,376 bss, RAM 83.3%. Both produce `merged.hex`. | `survey selftest` first (no radio needed), then `survey scan` → `survey show` prints real cells + APs; `survey gnss` → `survey show` prints a fix |
 | **CP2** | FW-1 struct fields: `channel`/`frequency`/`band` on Wi-Fi, `phys_cell_id` on cells; plumbed through `location.c` and `cloud_location.c` | Unit test in `tests/module/location/`: inject a fake Location event with known channel/freq/PCI, assert they survive onto the zbus message | `survey show` now displays channel/freq/band/PCI; cross-check against an independent Wi-Fi scan |
 | **CP3** | FW-5 CBOR encoder + CDDL + `version` field | Unit test: encode → decode round-trip; assert absent fields are **absent, not zero**; assert size ≤ 700 B with 10 APs + 10 neighbors and **record the measured size** | `survey hex` + `survey selftest` prints PASS |
 | **CP4** | HOST-1 decoder (reads CP3 output) | Golden-file test: fixture CBOR → expected JSON. Feed it the exact bytes from CP3's unit test so encoder and decoder are proven against each other | Decode a real `survey hex` dump from the device |
@@ -455,7 +478,7 @@ keeps the risk contained to one checkpoint instead of blocking the project.
 | Risk | Mitigation |
 |---|---|
 | USB CDC path via nRF5340 bridge unclear or slow | Settle in the first work item (FW-8) before depending on it |
-| GNSS↔LTE contention causes long cycles or `-EBUSY` | Strict sequencing; never cancel; characterise in verification 5 |
+| GNSS↔LTE contention causes long cycles or `-EBUSY` | Strict sequencing; scan-only requests answer the library instead of cancelling (done in CP1); characterise in verification 5 |
 | Time smear at highway speed floors achievable validation | Bracket + report uncertainty; validate tight accuracy claims at low speed |
 | 10-AP cap truncates dense urban scans | Accepted; document it so analysis can account for it |
 | Format churn invalidates earlier datasets | Mandatory `version` field; freeze the schema before large collection campaigns |
