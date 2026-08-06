@@ -42,6 +42,33 @@ FAKE_VALUE_FUNC(int, lte_lc_func_mode_set, enum lte_lc_func_mode);
 FAKE_VOID_FUNC(location_config_defaults_set, struct location_config *,
 	       uint8_t, enum location_method *);
 
+/* Snapshot of the method list passed to location_config_defaults_set.
+ *
+ * FFF records arg2_val as a pointer, but location.c builds its method list on the stack,
+ * so the memory is out of scope by the time a test reads it. Copy the contents while the
+ * call is in progress instead.
+ */
+#define METHODS_SNAPSHOT_MAX 4
+static enum location_method methods_snapshot[METHODS_SNAPSHOT_MAX];
+static uint8_t methods_snapshot_count;
+
+static void location_config_defaults_set_snapshot(struct location_config *config,
+						  uint8_t methods_count,
+						  enum location_method *method_types)
+{
+	ARG_UNUSED(config);
+
+	methods_snapshot_count = methods_count;
+
+	if (method_types == NULL) {
+		return;
+	}
+
+	for (uint8_t i = 0; i < methods_count && i < METHODS_SNAPSHOT_MAX; i++) {
+		methods_snapshot[i] = method_types[i];
+	}
+}
+
 /* Store the registered event handler */
 static location_event_handler_t registered_handler;
 
@@ -313,6 +340,9 @@ void setUp(void)
 	RESET_FAKE(date_time_now);
 	RESET_FAKE(location_method_str);
 	RESET_FAKE(location_config_defaults_set);
+	location_config_defaults_set_fake.custom_fake = location_config_defaults_set_snapshot;
+	memset(methods_snapshot, 0, sizeof(methods_snapshot));
+	methods_snapshot_count = 0;
 
 	/* Set up custom fakes */
 	location_init_fake.custom_fake = custom_location_init;
@@ -1481,6 +1511,111 @@ void test_gnss_fix_trigger(void)
 	/* Verify location_request was called with a config (not NULL) */
 	TEST_ASSERT_EQUAL(1, location_request_fake.call_count);
 	TEST_ASSERT_NOT_NULL(location_request_fake.arg0_val);
+}
+
+/* Test radio scan trigger requests Wi-Fi and cellular, adjacent and in that order.
+ *
+ * The ordering is load-bearing, not cosmetic: the Location library only combines Wi-Fi and
+ * cellular into a single cloud request carrying both when they are next to each other in
+ * the method list. If they were ever separated, a scan would resolve on Wi-Fi alone and
+ * silently stop producing cell observations.
+ */
+void test_scan_trigger(void)
+{
+	publish_and_consume_message(LOCATION_SCAN_SEARCH_TRIGGER);
+
+	TEST_ASSERT_EQUAL(1, location_config_defaults_set_fake.call_count);
+	TEST_ASSERT_EQUAL(2, location_config_defaults_set_fake.arg1_val);
+
+	TEST_ASSERT_EQUAL(2, methods_snapshot_count);
+	TEST_ASSERT_EQUAL(LOCATION_METHOD_WIFI, methods_snapshot[0]);
+	TEST_ASSERT_EQUAL(LOCATION_METHOD_CELLULAR, methods_snapshot[1]);
+
+	/* GNSS must not be requested: a GNSS fix would satisfy the request before any
+	 * scan happened.
+	 */
+	TEST_ASSERT_EQUAL(1, location_request_fake.call_count);
+	TEST_ASSERT_NOT_NULL(location_request_fake.arg0_val);
+}
+
+/* Test that a scan-only request winds down without location_request_cancel().
+ *
+ * location.h documents that cancelling cannot truly stop a Wi-Fi scan and can leave the
+ * next request returning -EBUSY. Scan requests are issued repeatedly by design, so this
+ * path hands the library an 'unknown' result instead.
+ */
+void test_scan_trigger_does_not_cancel(void)
+{
+	struct lte_lc_cells_info mock_cells_info = {
+		.current_cell = { .id = 0x12345678, .mcc = 242, .mnc = 1 },
+		.ncells_count = 0,
+		.gci_cells_count = 0
+	};
+	struct location_data_cloud mock_cloud_request = {
+		.cell_data = &mock_cells_info
+	};
+	struct location_event_data mock_event = {
+		.id = LOCATION_EVT_CLOUD_LOCATION_EXT_REQUEST,
+		.method = LOCATION_METHOD_WIFI_CELLULAR,
+		.cloud_location_request = mock_cloud_request
+	};
+
+	publish_and_consume_message(LOCATION_SCAN_SEARCH_TRIGGER);
+
+	simulate_location_event(&mock_event);
+	wait_for_processing();
+
+	/* The observation is still published -- that is the whole point of the request. */
+	consume_published_message(LOCATION_CLOUD_REQUEST);
+
+	/* But the hazardous cancel path must not be taken. */
+	TEST_ASSERT_EQUAL(0, location_request_cancel_fake.call_count);
+	TEST_ASSERT_EQUAL(1, location_cloud_location_ext_result_set_fake.call_count);
+	TEST_ASSERT_EQUAL(LOCATION_EXT_RESULT_UNKNOWN,
+			  location_cloud_location_ext_result_set_fake.arg0_val);
+}
+
+/* Test that an ordinary search still cancels, i.e. the asset-tracker path is unchanged. */
+void test_normal_trigger_still_cancels(void)
+{
+	struct lte_lc_cells_info mock_cells_info = {
+		.current_cell = { .id = 0x12345678, .mcc = 242, .mnc = 1 },
+		.ncells_count = 0,
+		.gci_cells_count = 0
+	};
+	struct location_data_cloud mock_cloud_request = {
+		.cell_data = &mock_cells_info
+	};
+	struct location_event_data mock_event = {
+		.id = LOCATION_EVT_CLOUD_LOCATION_EXT_REQUEST,
+		.method = LOCATION_METHOD_CELLULAR,
+		.cloud_location_request = mock_cloud_request
+	};
+
+	publish_and_consume_message(LOCATION_SEARCH_TRIGGER);
+
+	simulate_location_event(&mock_event);
+	wait_for_processing();
+
+	consume_published_message(LOCATION_CLOUD_REQUEST);
+	consume_published_message(LOCATION_SEARCH_CANCEL);
+
+	TEST_ASSERT_EQUAL(1, location_request_cancel_fake.call_count);
+	TEST_ASSERT_EQUAL(0, location_cloud_location_ext_result_set_fake.call_count);
+}
+
+/* Test radio scan trigger is ignored while a search is already active */
+void test_scan_trigger_while_active(void)
+{
+	publish_and_consume_message(LOCATION_SEARCH_TRIGGER);
+
+	RESET_FAKE(location_request);
+	RESET_FAKE(location_config_defaults_set);
+
+	publish_and_consume_message(LOCATION_SCAN_SEARCH_TRIGGER);
+
+	TEST_ASSERT_EQUAL(0, location_config_defaults_set_fake.call_count);
+	TEST_ASSERT_EQUAL(0, location_request_fake.call_count);
 }
 
 /* Test GNSS fix trigger is ignored while a search is already active */

@@ -86,6 +86,20 @@ enum location_msg_type {
 	 * - Be aware that Wi-Fi scan results may be incomplete or lost
 	 */
 	LOCATION_SEARCH_CANCEL,
+
+	/* Request a scan of the radio environment only: Wi-Fi and cellular, no GNSS.
+	 *
+	 * LOCATION_SEARCH_TRIGGER cannot be used to obtain cell and Wi-Fi observations,
+	 * because the Location library treats its method list as a fallback chain and
+	 * stops at the first method that succeeds -- with the default list a GNSS fix
+	 * ends the request before any scan is performed.
+	 *
+	 * Wi-Fi and cellular are placed next to each other in the method list, which the
+	 * Location library combines into a single cloud request carrying both, published
+	 * as LOCATION_CLOUD_REQUEST. On failure/timeout, LOCATION_SEARCH_DONE is
+	 * published.
+	 */
+	LOCATION_SCAN_SEARCH_TRIGGER,
 };
 
 /** Wi-Fi access point information. */

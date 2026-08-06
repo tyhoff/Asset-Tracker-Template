@@ -40,6 +40,17 @@ config APP_LOCATION_WIFI_APS_MAX
 	help
 	  Maximum number of Wi-Fi access points to store in a location request.
 
+config APP_LOCATION_SCAN_TRIGGER
+	bool "Radio scan trigger"
+	depends on LOCATION_METHOD_WIFI && LOCATION_METHOD_CELLULAR
+	help
+	  Handle LOCATION_SCAN_SEARCH_TRIGGER, which requests a Wi-Fi and cellular scan
+	  with no GNSS. Needed to obtain cell and Wi-Fi observations on demand:
+	  LOCATION_SEARCH_TRIGGER cannot do it, because the Location library stops at the
+	  first method that succeeds and a GNSS fix ends the request before any scan runs.
+
+	  Default n so that applications which do not need it are unaffected.
+
 config APP_LOCATION_NEIGHBOR_CELLS_MAX
 	int "Maximum number of neighbor cells"
 	default 10

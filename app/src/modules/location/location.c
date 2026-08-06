@@ -181,6 +181,12 @@ static void location_wdt_callback(int channel_id, void *user_data)
 	SEND_FATAL_ERROR_WATCHDOG_TIMEOUT();
 }
 
+/* True while the ongoing request came from LOCATION_SCAN_SEARCH_TRIGGER, which wants the
+ * raw scan and nothing else. Only ever written from the module thread, before the request
+ * that reads it is started.
+ */
+static bool scan_only_request;
+
 #if defined(CONFIG_LOCATION_METHOD_WIFI) || defined(CONFIG_LOCATION_METHOD_CELLULAR)
 static void cloud_request_send(const struct location_data_cloud *cloud_request)
 {
@@ -332,6 +338,8 @@ static enum smf_state_result state_location_search_inactive_run(void *obj)
 		} else if (location_msg->type == LOCATION_SEARCH_TRIGGER) {
 			LOG_DBG("Location search trigger received");
 
+			scan_only_request = false;
+
 			err = location_request(NULL);
 			if (err) {
 				LOG_WRN("location_request, error: %d", err);
@@ -351,7 +359,37 @@ static enum smf_state_result state_location_search_inactive_run(void *obj)
 
 			LOG_DBG("GNSS fix trigger received");
 
+			scan_only_request = false;
+
 			location_config_defaults_set(&config, 1, methods);
+
+			err = location_request(&config);
+			if (err) {
+				LOG_WRN("location_request, error: %d", err);
+				SEND_FATAL_ERROR();
+
+				return SMF_EVENT_HANDLED;
+			}
+
+			smf_set_state(SMF_CTX(state_object), &states[STATE_LOCATION_SEARCH_ACTIVE]);
+
+			return SMF_EVENT_HANDLED;
+		} else if (IS_ENABLED(CONFIG_APP_LOCATION_SCAN_TRIGGER) &&
+			   location_msg->type == LOCATION_SCAN_SEARCH_TRIGGER) {
+			struct location_config config;
+			/* Adjacent in the method list, which makes the Location library
+			 * combine them into a single cloud request carrying both.
+			 */
+			enum location_method methods[] = {
+				LOCATION_METHOD_WIFI,
+				LOCATION_METHOD_CELLULAR
+			};
+
+			LOG_DBG("Radio scan trigger received");
+
+			scan_only_request = true;
+
+			location_config_defaults_set(&config, ARRAY_SIZE(methods), methods);
 
 			err = location_request(&config);
 			if (err) {
@@ -387,7 +425,9 @@ static enum smf_state_result state_location_search_active_run(void *obj)
 		int err;
 
 		if (location_msg->type == LOCATION_SEARCH_TRIGGER ||
-		    location_msg->type == LOCATION_GNSS_SEARCH_TRIGGER) {
+		    location_msg->type == LOCATION_GNSS_SEARCH_TRIGGER ||
+		    (IS_ENABLED(CONFIG_APP_LOCATION_SCAN_TRIGGER) &&
+		     location_msg->type == LOCATION_SCAN_SEARCH_TRIGGER)) {
 			LOG_DBG("Location trigger received while active, ignoring");
 		} else if (location_msg->type == LOCATION_SEARCH_CANCEL) {
 			LOG_DBG("Location search cancel received, cancelling location request");
@@ -521,6 +561,22 @@ static void location_event_handler(const struct location_event_data *event_data)
 		LOG_DBG("Cloud location request received from location library");
 
 		cloud_request_send(&event_data->cloud_location_request);
+
+		if (IS_ENABLED(CONFIG_APP_LOCATION_SCAN_TRIGGER) && scan_only_request) {
+			/* A scan-only request has already produced everything it was asked
+			 * for. Hand the library an 'unknown' result so it winds the request
+			 * down through its own state machine instead of being cancelled:
+			 * location_request_cancel() cannot truly cancel a Wi-Fi scan and can
+			 * leave the next request returning -EBUSY (see location.h), which
+			 * matters here because scan requests are issued repeatedly.
+			 *
+			 * Wi-Fi and cellular are combined into a single method for these
+			 * requests, so there is no method left to fall back to and the
+			 * library finishes with LOCATION_EVT_RESULT_UNKNOWN.
+			 */
+			location_cloud_location_ext_result_set(LOCATION_EXT_RESULT_UNKNOWN, NULL);
+			break;
+		}
 
 		/* Cancel the current location request to avoid falling back to the next
 		 * location source. Treat the fact that we have found Wi-Fi APs and/or cellular data

@@ -36,6 +36,16 @@ The location module publishes and receives messages over the zbus channel `locat
 - **LOCATION_GNSS_SEARCH_TRIGGER:**
   Requests a GNSS-only fix, bypassing Wi-Fi and cellular methods.
 
+- **LOCATION_SCAN_SEARCH_TRIGGER:**
+  Requests a Wi-Fi and cellular scan with no GNSS, publishing the result as
+  **LOCATION_CLOUD_REQUEST**. Handled only when **CONFIG_APP_LOCATION_SCAN_TRIGGER** is enabled.
+
+    This exists because **LOCATION_SEARCH_TRIGGER** cannot be used to obtain cell and Wi-Fi
+    observations: the Location library treats its method list as a fallback chain and stops at the
+    first method that succeeds, so a GNSS fix ends the request before any scan is performed.
+    Wi-Fi and cellular are placed next to each other in the method list, which makes the Location
+    library combine them into a single cloud request carrying both.
+
 - **LOCATION_SEARCH_CANCEL:**
   Cancels an ongoing location search. See `location.h` for known limitations with Wi-Fi scanning.
 
@@ -72,6 +82,7 @@ enum location_msg_type {
     LOCATION_SEARCH_TRIGGER,
     LOCATION_GNSS_SEARCH_TRIGGER,
     LOCATION_SEARCH_CANCEL,
+    LOCATION_SCAN_SEARCH_TRIGGER,
 };
 ```
 
@@ -98,6 +109,22 @@ Several Kconfig options in `Kconfig.location` control this module's behavior. Th
 - **CONFIG_APP_LOCATION_MSG_PROCESSING_TIMEOUT_SECONDS:**
   Maximum time allowed for processing a single message (default: 60 seconds).
   Must be smaller than the value set in the **CONFIG_APP_LOCATION_WATCHDOG_TIMEOUT_SECONDS** Kconfig option.
+
+- **CONFIG_APP_LOCATION_WIFI_APS_MAX:**
+  Maximum number of Wi-Fi access points recorded in a location request (default: 10).
+  Scans in dense environments will see more than this and be truncated.
+
+- **CONFIG_APP_LOCATION_NEIGHBOR_CELLS_MAX:**
+  Maximum number of neighbor cells recorded in a location request (default: 10).
+
+- **CONFIG_APP_LOCATION_SCAN_TRIGGER:**
+  Handle **LOCATION_SCAN_SEARCH_TRIGGER**, a Wi-Fi and cellular scan with no GNSS (default: `n`).
+  Requires both the Wi-Fi and cellular location methods. Selected by **CONFIG_APP_SURVEY**.
+
+    When a scan-only request produces its cloud request, the module responds to the Location library
+    with `LOCATION_EXT_RESULT_UNKNOWN` rather than cancelling the request. Cancelling cannot truly
+    stop a Wi-Fi scan and can leave the next request returning `-EBUSY`, which matters because
+    scan-only requests are issued repeatedly.
 
 For more details on these configurations, refer to `Kconfig.location`.
 
