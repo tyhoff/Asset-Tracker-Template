@@ -499,3 +499,77 @@ FW-3 requires no work — it exists only to record the decision not to pursue `a
 
 FW-1 (CP2), FW-5 (CP3), and HOST-1 (CP4) are the schema-critical path and should be reviewed
 together before anything is built on top of them.
+
+---
+
+## Configuration decisions
+
+Rationale for the non-obvious settings in `app/overlay-survey.conf`. The overlay itself
+carries one-line comments; the reasoning lives here.
+
+### No cloud communication (`APP_CLOUD_LOCATION=n`, `APP_CLOUD_PROVISIONING=n`)
+
+`CONFIG_APP_CLOUD=n` does not build: `main.c` includes `cloud.h` and `fota.h`
+unconditionally and references them throughout. Rather than patch `main.c`, two new
+Kconfig options gate the parts that matter, following the module's existing
+`APP_LOCATION` / `APP_ENVIRONMENTAL` pattern:
+
+- **`APP_CLOUD_LOCATION`** excludes `cloud_location.c`, which is the only caller of
+  `nrf_cloud_coap_location_get()`. This is what actually enforces FW-10. Relying on the
+  device having no credentials is not enforcement: a coworker's previously-claimed
+  Thingy:91 X would resolve position on every scan.
+- **`APP_CLOUD_PROVISIONING`** prevents entry into `STATE_PROVISIONING`. That state
+  publishes `LOCATION_SEARCH_CANCEL` (provisioning needs offline LTE mode), which is the
+  `-EBUSY` hazard FW-2 warns about, and without a provisioning service to respond the
+  module would wait there for the rest of the boot.
+
+`CONFIG_NRF_PROVISIONING` is deliberately left `y`. Setting it `n` orphans ten
+`CONFIG_NRF_PROVISIONING_*` assignments in `prj.conf`, which aborts the Kconfig stage on a
+clean build. The client is built but never triggered.
+
+`APP_CLOUD_BACKOFF_INITIAL_SECONDS` must not exceed `APP_CLOUD_BACKOFF_MAX_SECONDS`;
+`cloud.c` asserts on it, and with `CONFIG_RESET_ON_FATAL_ERROR=y` a violation reboots the
+device.
+
+### Time (`DATE_TIME_NTP` left enabled)
+
+NTP is a data consumer but the wrong one to remove: correlating a GNSS fix with the scan
+beside it is the point of the dataset, so the clock is load-bearing. `date_time` prefers
+modem NITZ time, verified present on target — `AT+CCLK?` returns a timezone offset, which
+NTP cannot supply. NTP only fires when NITZ is absent and the clock has gone stale.
+
+Better still, and not yet implemented: a GNSS fix carries UTC in its PVT frame, so the
+survey module could call `date_time_set()` and stop depending on the network for time.
+
+### Raw GNSS (`NRF_CLOUD_AGNSS=n`)
+
+Deviates from FW-10, which recommends A-GNSS. The device runs on vehicle power, so the
+energy saved on a fast first fix does not matter, and the modem retains ephemeris for
+hours, making tunnels and GNSS/LTE interleaving warm starts. Cost is the first fix after
+power-on. Reversible: delete the line and claim the device on nRF Cloud.
+`CONFIG_NRF_CLOUD_PGPS` is worth evaluating first — one download gives roughly two weeks
+of predicted ephemeris, so the device contacts the cloud only fortnightly.
+
+### GNSS tuning
+
+`LOCATION_REQUEST_DEFAULT_GNSS_VISIBILITY_DETECTION=n` is the important one. It aborts a
+request after 3 s when fewer than 3 satellites are visible. On target that turned a
+perfectly obtainable fix into three consecutive failures: with detection off, the same
+device fixed in **33.7 s having acquired 5 satellites**. For a survey device the feature
+converts obstructed sky into missing data.
+
+`GNSS_TIMEOUT=600000` with `TIMEOUT=660000` (the overall timeout must exceed the
+per-method one). `GNSS_NUM_CONSECUTIVE_FIXES=2`, the minimum the symbol allows — its range
+is [2, 256].
+
+Consequence: a GNSS request can hold the location module for minutes, and triggers
+arriving meanwhile are dropped. `location.c` logs that at warning level and
+`survey_shell.c` says so, because otherwise `survey show` returns a stale scan that looks
+fresh.
+
+### Sampling interval
+
+`APP_SAMPLING_INTERVAL_SECONDS=86400` suppresses the asset-tracker's repeat sampling but
+**not** the sample it takes at startup, which still issues one GNSS-first location request
+per boot. Its results are indistinguishable from the survey's on `location_chan`.
+Eliminating the second driver is FW-7 / CP6 work.

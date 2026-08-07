@@ -46,11 +46,17 @@ Registered under `survey` when `CONFIG_APP_SURVEY_SHELL` is enabled (default `y`
 | Command | Purpose |
 |---|---|
 | `survey scan` | Request a Wi-Fi + cellular scan. Takes about 5–10 s. |
-| `survey gnss` | Request a GNSS-only fix. Up to 60 s outdoors, longer from cold. |
+| `survey gnss` | Request a GNSS-only fix. Seconds once warm; minutes from cold without assistance data. |
 | `survey show` | Print the cached GNSS fix and radio scan. |
 | `survey stats` | Print observation counters and how old the cached data is. |
 | `survey clear` | Discard the cached observation. |
 | `survey selftest` | Render a synthetic observation. Needs no SIM, antenna or sky view. |
+
+**Only one search runs at a time.** A trigger that arrives while a search is already in
+progress is discarded by the location module, which logs a warning. This matters most after
+`survey gnss`, because a cold fix can occupy the module for minutes — a `survey scan` issued
+during that window does nothing, and `survey show` would then return the *previous* scan.
+Check `survey stats` for the cache age if in doubt.
 
 `survey scan` and `survey gnss` are separate on purpose. The Location library treats its method list
 as a **fallback chain and stops at the first method that succeeds**, so a request that includes GNSS
@@ -61,6 +67,35 @@ everything from the observation cache to the console is functioning, so an empty
 afterwards points at the radio rather than the firmware. Injected data is marked with a
 `SYNTHETIC SELFTEST DATA` banner that persists until a real observation replaces it or
 `survey clear` is run, so it can never be mistaken for a measurement.
+
+### Driving the shell from a host
+
+`scripts/survey_console.py` sends these commands over the USB CDC port and prints the reply, so
+sessions can be scripted instead of typed into a terminal emulator. It needs `pyserial`, which the
+nRF Connect SDK toolchain already provides:
+
+```
+nrfutil toolchain-manager launch --ncs-version v3.4.0 -- \
+    python3 scripts/survey_console.py --identify
+```
+
+The Thingy:91 X presents two CDC ports through the nRF5340 connectivity bridge — the nRF9151
+application console and the nRF5340 itself. `--identify` probes the Nordic-VID ports and reports which one answers
+the `survey` command; that is the nRF9151.
+
+| Invocation | Purpose |
+|---|---|
+| `--list` | List candidate serial ports. |
+| `--identify` | Probe Nordic candidate ports and show what each answers. |
+| `--probe-all` | With `--identify`, also write to non-Nordic ports. |
+| `survey selftest` | Run one command and print its reply. |
+| `-n 5 -d 12 survey scan` | Repeat a command, five times at 12 s spacing. |
+| `--monitor -t 30` | Print incoming output without sending anything. |
+| `--loopback survey selftest` | Exercise the script against a built-in fake shell, no hardware. |
+
+Repeating `survey scan` is the check that matters most after a firmware change: the Location library
+cannot truly cancel a Wi-Fi scan, so a mishandled request leaves the next one returning `-EBUSY`.
+Several scans in a row passing is what demonstrates that path is healthy.
 
 ## Reading the output
 
