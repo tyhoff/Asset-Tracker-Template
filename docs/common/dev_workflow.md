@@ -84,8 +84,11 @@ proves it still compiles. Check for the object file if in doubt:
 find /Users/tyler/junk/ncs-3.4.0/build-att-default -name 'cloud_location.c.obj'
 ```
 
-Add `--pristine` when changing Kconfig or devicetree. Sysbuild caches aggressively and a stale
-cache produces confusing results.
+Add `-p always` when changing Kconfig or devicetree. Sysbuild caches aggressively and a stale cache
+produces confusing results — a changed Kconfig default in particular may not be picked up.
+
+Use `-p always`, not a bare `--pristine`: the long form takes a value, so `--pristine <source_dir>`
+consumes the source directory as its argument and fails with `invalid choice`.
 
 ### When a BUILD_ASSERT about buffer size fires
 
@@ -200,6 +203,24 @@ the log. It looks like the command did nothing: `survey show` reports `gnss #1, 
 This has been observed on essentially every reflash. It is not a bug in the shell command. Wait for
 the boot sample to finish (check `survey stats`) and re-issue the scan. A cold GNSS fix can hold the
 module for minutes.
+
+Note that `survey clear` resets the counters too, so a `clear` followed by a dropped scan reads as
+`gnss #0, scan #0` and looks like a dead device when it is merely busy.
+
+### Do not diagnose from the log output
+
+No log lines appeared on either CDC port during normal bench operation, including across a scan, so
+absence of logging says nothing about whether the device is healthy. Diagnose from the shell instead:
+
+| Command | Answers |
+|---|---|
+| `survey stats` | Did an observation actually land? How stale is it? |
+| `kernel thread list` | Is any module thread blocked rather than pending? |
+| `kernel uptime` | Did the device silently reset? |
+| `at AT+CEREG?` | Is the modem registered? |
+| `at AT+CFUN?` | Is the modem even switched on? |
+
+`survey selftest` remains the fastest way to separate a radio problem from a firmware one.
 
 ## Unit tests
 
