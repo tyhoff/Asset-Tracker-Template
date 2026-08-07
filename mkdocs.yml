@@ -75,6 +75,7 @@ ft_options:
 nav:
   - Overview: index.md
   - Getting started: common/getting_started.md
+  - Development workflow: common/dev_workflow.md
   - Architecture: common/architecture.md
   - Configuration: common/configuration.md
   - Modifying the template: common/modifying.md

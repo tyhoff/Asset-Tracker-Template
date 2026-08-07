@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include <zephyr/kernel.h>
+#include <zephyr/net/wifi.h>
 #include <modem/lte_lc.h>
 
 #include "survey_obs.h"
@@ -120,9 +121,11 @@ static struct location_msg scan_msg(void)
 			.wifi_cnt = 2,
 			.wifi_aps = {
 				{ .rssi = -62, .mac_length = 6,
-				  .mac = { 0x00, 0x11, 0x22, 0x33, 0x44, 0x55 } },
+				  .mac = { 0x00, 0x11, 0x22, 0x33, 0x44, 0x55 },
+				  .channel = 6, .band = WIFI_FREQ_BAND_2_4_GHZ },
 				{ .rssi = -80, .mac_length = 6,
-				  .mac = { 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF } },
+				  .mac = { 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF },
+				  .channel = 36, .band = WIFI_FREQ_BAND_5_GHZ },
 			},
 		},
 	};
@@ -496,7 +499,7 @@ void test_timing_advance_of_zero_is_treated_as_absent(void)
 	ASSERT_OUT_HAS("adv absent");
 }
 
-void test_missing_struct_fields_are_reported_rather_than_shown_as_empty(void)
+void test_omitted_pci_is_reported_as_deliberate_rather_than_as_a_gap(void)
 {
 	struct location_msg msg = scan_msg();
 	struct survey_observation o;
@@ -505,16 +508,84 @@ void test_missing_struct_fields_are_reported_rather_than_shown_as_empty(void)
 	survey_obs_snapshot(&o);
 	survey_obs_format(&o, capture, NULL);
 
-	/* PCI for the serving/GCI cells, and Wi-Fi channel/frequency/band, are reported by
-	 * the modem but dropped by the location module's structs. Until those fields are
-	 * added, the renderer says so explicitly -- otherwise an operator reading a bench
-	 * capture would conclude the radio failed to report them.
-	 *
-	 * These assertions are expected to be deleted by the checkpoint that plumbs the
-	 * fields through, which is exactly the intent: the reminder cannot rot silently.
+	/* mcc/mnc/eci/tac identify these cells globally, so PCI is not captured for them.
+	 * The renderer has to say that it was a choice: an operator reading a bench capture
+	 * must not conclude the radio failed to report it, nor file it as a defect.
 	 */
-	ASSERT_OUT_HAS("pci not captured yet");
-	ASSERT_OUT_HAS("channel/frequency/band not captured yet");
+	ASSERT_OUT_HAS("pci not captured (not needed for an identified cell)");
+}
+
+void test_wifi_frequency_is_derived_from_channel_and_band(void)
+{
+	struct location_msg msg = scan_msg();
+	struct survey_observation o;
+
+	survey_obs_update(&msg, 1000, SURVEY_TIME_BASE_UNIX);
+	survey_obs_snapshot(&o);
+	survey_obs_format(&o, capture, NULL);
+
+	/* The Wi-Fi driver reports channel and band but never a frequency, so the rendered
+	 * frequency is computed. Channel numbers repeat across bands, which is why both
+	 * inputs matter -- these two cases would collide if band were ignored.
+	 */
+	ASSERT_OUT_HAS("channel 6 frequency 2437 MHz band 2.4GHz");
+	ASSERT_OUT_HAS("channel 36 frequency 5180 MHz band 5GHz");
+}
+
+void test_absent_wifi_channel_is_not_rendered_as_a_frequency(void)
+{
+	struct location_msg msg = scan_msg();
+	struct survey_observation o;
+
+	/* Channel 0 does not exist, so it is the driver's "not reported" value. Feeding it
+	 * to the frequency formula would invent 2407 MHz out of a missing measurement.
+	 */
+	msg.cloud_request.wifi_cnt = 1;
+	msg.cloud_request.wifi_aps[0].channel = 0;
+	msg.cloud_request.wifi_aps[0].band = WIFI_FREQ_BAND_2_4_GHZ;
+
+	survey_obs_update(&msg, 1000, SURVEY_TIME_BASE_UNIX);
+	survey_obs_snapshot(&o);
+	survey_obs_format(&o, capture, NULL);
+
+	ASSERT_OUT_HAS("channel absent");
+	ASSERT_OUT_LACKS("2407 MHz");
+}
+
+void test_underivable_frequency_is_reported_rather_than_computed(void)
+{
+	struct location_msg msg = scan_msg();
+	struct survey_observation o;
+
+	/* An unrecognised band reaches the formatter; "0 MHz" would read as a measurement. */
+	msg.cloud_request.wifi_cnt = 1;
+	msg.cloud_request.wifi_aps[0].channel = 44;
+	msg.cloud_request.wifi_aps[0].band = WIFI_FREQ_BAND_UNKNOWN;
+
+	survey_obs_update(&msg, 1000, SURVEY_TIME_BASE_UNIX);
+	survey_obs_snapshot(&o);
+	survey_obs_format(&o, capture, NULL);
+
+	ASSERT_OUT_HAS("channel 44 frequency undetermined");
+	ASSERT_OUT_LACKS("0 MHz");
+}
+
+void test_channel_outside_its_band_does_not_produce_a_frequency(void)
+{
+	struct location_msg msg = scan_msg();
+	struct survey_observation o;
+
+	/* Channel 165 is 5 GHz; the 2.4 GHz formula would yield a bogus 3232 MHz. */
+	msg.cloud_request.wifi_cnt = 1;
+	msg.cloud_request.wifi_aps[0].channel = 165;
+	msg.cloud_request.wifi_aps[0].band = WIFI_FREQ_BAND_2_4_GHZ;
+
+	survey_obs_update(&msg, 1000, SURVEY_TIME_BASE_UNIX);
+	survey_obs_snapshot(&o);
+	survey_obs_format(&o, capture, NULL);
+
+	ASSERT_OUT_HAS("channel 165 frequency undetermined");
+	ASSERT_OUT_LACKS("3232");
 }
 
 void test_ap_and_neighbor_counts_bound_the_rendered_entries(void)

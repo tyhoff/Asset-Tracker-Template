@@ -223,6 +223,12 @@ static void verify_wifi_cloud_request(const struct wifi_scan_info *expected_wifi
 				  received_msg.cloud_request.wifi_aps[i].rssi);
 		TEST_ASSERT_EQUAL(expected_wifi->ap_info[i].mac_length,
 				  received_msg.cloud_request.wifi_aps[i].mac_length);
+
+		/* copy_wifi_data() copies field by field, so a dropped field is silent. */
+		TEST_ASSERT_EQUAL(expected_wifi->ap_info[i].channel,
+				  received_msg.cloud_request.wifi_aps[i].channel);
+		TEST_ASSERT_EQUAL(expected_wifi->ap_info[i].band,
+				  received_msg.cloud_request.wifi_aps[i].band);
 	}
 }
 

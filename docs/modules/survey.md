@@ -14,7 +14,10 @@ behaves identically when it is off. Build it with the provided overlay:
 west build -b thingy91x/nrf9151/ns --sysbuild app -- -DEXTRA_CONF_FILE=overlay-survey.conf
 ```
 
-See `REQUIREMENTS.md` in the repository root for the full specification.
+See `REQUIREMENTS.md` in the repository root for the full specification, and
+[Development workflow](../common/dev_workflow.md) for the bench procedure — building through the
+toolchain manager, serial-recovery flashing, updating the modem, and running the unit tests on
+macOS.
 
 ## Operation
 
@@ -114,17 +117,35 @@ Two conventions matter when reading a capture:
   them through unconverted; the ground-fix API expects dBm/dB. Both forms are printed — for example
   `rsrp 55 (idx) = -86 dBm` — so the conversion can be checked against a real network.
 
-Fields marked `not captured yet (firmware limitation)` are reported by the modem but dropped by the
-location module's data structures: the physical cell ID of the serving and GCI cells, and the
-channel, frequency and band of each access point. They are called out explicitly so that a missing
-value is not misread as a radio failure.
+Two fields are deliberately **not** captured:
 
-SSID is deliberately **not** captured.
+- **SSID** — not worth the storage. Nothing is printed about it.
+- **`pci` on identified cells** (serving and GCI). `mcc`/`mnc`/`eci`/`tac` already identify those
+  cells globally, so the physical cell ID adds nothing a lookup can use. Neighbors in `nmr[]` have
+  no identity and *do* carry `pci` — it is the only thing distinguishing them. Here the console
+  *does* say so, printing `pci not captured (not needed for an identified cell)`, so the absence
+  cannot be misread as a scan failure.
+
+**Wi-Fi `frequency` is derived, not measured.** `struct wifi_scan_result` reports `channel` and
+`band` but never a frequency, and frequency is a pure function of the two, so the firmware computes
+it for display and stores only `channel` and `band`. The host decoder will apply the same mapping to
+emit the ground-fix `frequency` field (CP4). Channel numbers repeat across bands — channel 1 exists
+in both 2.4 GHz and 6 GHz — which is why `band` is captured alongside.
+
+Two lines report a frequency that could not be derived, and neither ever prints a number that was
+not measured:
+
+- `channel absent` — the driver reported channel 0. Channel 0 does not exist, so it is the
+  not-reported value, and it is never converted to a frequency.
+- `frequency undetermined` — the channel was measured but the band is unrecognised, or the channel
+  lies outside the range that band uses. The channel is still printed; the frequency is not
+  invented. The driver passes the firmware's band value through without validating it, so this is
+  reachable rather than theoretical.
 
 ## Limitations
 
 - At most `CONFIG_APP_LOCATION_WIFI_APS_MAX` (10) access points and
-  `CONFIG_APP_LOCATION_NEIGHBOR_CELLS_MAX` (10) neighbor cells are recorded. Dense urban
+  `CONFIG_APP_LOCATION_NEIGHBOR_CELLS_MAX` (8) neighbor cells are recorded. Dense urban
   environments will exceed this and be truncated — an accepted tradeoff. Analysis of dense-area
   captures should account for it.
 - Timing advance (`adv`) is only measured while the modem is RRC-connected, which this application

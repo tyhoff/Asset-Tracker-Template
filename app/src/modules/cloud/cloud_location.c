@@ -115,6 +115,15 @@ static int wifi_ap_data_construct(struct wifi_scan_info *dest,
 		       src->wifi_aps[i].mac,
 		       WIFI_MAC_ADDR_LEN);
 		ap_info[i].mac_length = src->wifi_aps[i].mac_length;
+		ap_info[i].channel = src->wifi_aps[i].channel;
+		ap_info[i].band = src->wifi_aps[i].band;
+
+		/* ap_info is uninitialised caller stack. Of the fields this function does
+		 * not fill, only ssid_length and ssid[0] are read for entries within cnt
+		 * (copy_wifi_info() in nrf_cloud_coap_codec.c); security and mfp are not.
+		 */
+		ap_info[i].ssid_length = 0;
+		ap_info[i].ssid[0] = '\0';
 	}
 
 	dest->ap_info = ap_info;

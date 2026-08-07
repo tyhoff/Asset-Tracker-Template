@@ -94,6 +94,8 @@ static int copy_wifi_data(struct location_cloud_request_data *dest,
 		       src->ap_info[i].mac,
 		       WIFI_MAC_ADDR_LEN);
 		dest->wifi_aps[i].mac_length = src->ap_info[i].mac_length;
+		dest->wifi_aps[i].channel = src->ap_info[i].channel;
+		dest->wifi_aps[i].band = src->ap_info[i].band;
 	}
 
 	dest->wifi_cnt = src->cnt;

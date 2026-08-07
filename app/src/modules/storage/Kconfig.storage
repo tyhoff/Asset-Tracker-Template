@@ -78,11 +78,17 @@ config APP_STORAGE_MAX_RECORDS_PER_TYPE
 
 config APP_STORAGE_BATCH_BUFFER_SIZE
 	int "Storage batch buffer size in bytes"
-	default 512
+	default 576
 	help
 	  Size of the internal pipe used to stream batch data from the
 	  storage backend to the consumer. Must be large enough to hold
 	  one storage data item plus its pipe header.
+
+	  The largest item is struct location_msg, so this has to grow
+	  whenever a field is added to it. A BUILD_ASSERT in storage.c
+	  fails at compile time when it is too small, and names this
+	  symbol; it is not a runtime failure. 576 leaves headroom over
+	  the 516 bytes currently required.
 
 config APP_STORAGE_SESSION_TIMEOUT_SECONDS
 	int "Storage batch session timeout"

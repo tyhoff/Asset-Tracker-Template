@@ -112,6 +112,14 @@ struct location_wifi_ap_info {
 
 	/** Length of the MAC address. */
 	uint8_t mac_length;
+
+	/** Channel number. Zero when not reported. */
+	uint8_t channel;
+
+	/** Frequency band, see enum wifi_frequency_bands. Only meaningful when
+	 *  channel is non-zero: zero here means 2.4 GHz, not "absent".
+	 */
+	uint8_t band;
 };
 
 /** Cell information.

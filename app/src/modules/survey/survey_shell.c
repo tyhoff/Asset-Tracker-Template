@@ -14,6 +14,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/shell/shell.h>
 #include <zephyr/zbus/zbus.h>
+#include <zephyr/net/wifi.h>
 #include <modem/lte_lc.h>
 #include <stdarg.h>
 
@@ -181,7 +182,9 @@ static int cmd_survey_selftest(const struct shell *sh, size_t argc, char **argv)
 			.wifi_aps = {
 				{ .rssi = -62,
 				  .mac = { 0x00, 0x11, 0x22, 0x33, 0x44, 0x55 },
-				  .mac_length = 6 },
+				  .mac_length = 6,
+				  .channel = 6,
+				  .band = WIFI_FREQ_BAND_2_4_GHZ },
 			},
 		},
 	};
@@ -192,7 +195,7 @@ static int cmd_survey_selftest(const struct shell *sh, size_t argc, char **argv)
 	survey_obs_format(&scratch.obs, shell_line_print, (void *)sh);
 
 	shell_print(sh, "Expected: lat 63.4212340, eci 12345678, rsrp -86 dBm, "
-			"1 neighbor, 1 AP 00:11:22:33:44:55.");
+			"1 neighbor, 1 AP 00:11:22:33:44:55 on channel 6 = 2437 MHz.");
 
 	return 0;
 }

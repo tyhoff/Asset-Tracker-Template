@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include <zephyr/kernel.h>
+#include <zephyr/net/wifi.h>
 #include <modem/lte_lc.h>
 
 #include "survey_obs.h"
@@ -32,6 +33,47 @@ static double survey_rsrq_idx_to_db(int idx)
 		return ((double)idx - 40) * 0.5;
 	}
 	return ((double)idx - 41) * 0.5;
+}
+
+/* IEEE 802.11 channel to frequency. struct wifi_scan_result has no frequency field, so it
+ * is derived for display rather than stored. Channel numbers repeat across bands, hence the
+ * band parameter. Out-of-range pairs return 0 rather than a fabricated frequency; the driver
+ * does not validate the band.
+ */
+static uint16_t wifi_frequency_mhz(uint8_t band, uint8_t channel)
+{
+	switch (band) {
+	case WIFI_FREQ_BAND_2_4_GHZ:
+		if (channel == 14) {
+			return 2484;
+		}
+		return (channel >= 1 && channel <= 13) ? 2407 + (5 * channel) : 0;
+	case WIFI_FREQ_BAND_5_GHZ:
+		/* 184-196 is the Japanese 4.9 GHz band, which uses a 4000 MHz base. */
+		return (channel >= 32 && channel <= 177) ? 5000 + (5 * channel) : 0;
+	case WIFI_FREQ_BAND_6_GHZ:
+		if (channel == 2) {
+			return 5935;
+		}
+		return (channel >= 1 && channel <= 233) ? 5950 + (5 * channel) : 0;
+	default:
+		return 0;
+	}
+}
+
+/* Not wifi_band_txt(): that lives in the Wi-Fi L2, which native_sim does not link. */
+static const char *wifi_band_str(uint8_t band)
+{
+	switch (band) {
+	case WIFI_FREQ_BAND_2_4_GHZ:
+		return "2.4GHz";
+	case WIFI_FREQ_BAND_5_GHZ:
+		return "5GHz";
+	case WIFI_FREQ_BAND_6_GHZ:
+		return "6GHz";
+	default:
+		return "unknown";
+	}
 }
 
 /* Absence predicates.
@@ -223,12 +265,12 @@ static void format_identified_cell(survey_print_fn print, void *ctx, const char 
 		print(ctx, "%sadv %u", indent, cell->timing_advance);
 	}
 
-	/* struct location_cell_info carries no PCI, so the serving cell and every GCI
-	 * cell lose their physical cell ID on the way through the location module even
-	 * though the modem reports it. Adding the field is the next checkpoint; until
-	 * then this line is the reminder that the gap is real and not an empty scan.
+	/* PCI is deliberately not captured for identified cells: mcc/mnc/eci/tac already
+	 * identify the cell globally, so the physical cell ID adds nothing a lookup can
+	 * use. Neighbors, which have no identity, do carry it. Stated explicitly so the
+	 * absence does not read as a scan failure.
 	 */
-	print(ctx, "%spci not captured yet (firmware limitation)", indent);
+	print(ctx, "%spci not captured (not needed for an identified cell)", indent);
 }
 
 static void format_gnss(const struct survey_observation *o, survey_print_fn print, void *ctx)
@@ -312,11 +354,24 @@ static void format_scan(const struct survey_observation *o, survey_print_fn prin
 		      ap->mac[0], ap->mac[1], ap->mac[2], ap->mac[3], ap->mac[4], ap->mac[5],
 		      ap->mac_length);
 		print(ctx, "        signalStrength %d dBm", ap->rssi);
-		/* channel and frequency are reported by the Wi-Fi driver but dropped by
-		 * struct location_wifi_ap_info. Added in the next checkpoint.
+
+		/* Channel 0 is not a valid Wi-Fi channel, so it is the driver's "not
+		 * reported" value; band alone would be meaningless without it.
 		 */
-		print(ctx, "        channel/frequency/band not captured yet "
-			   "(firmware limitation)");
+		if (ap->channel == 0) {
+			print(ctx, "        channel absent");
+		} else {
+			uint16_t freq = wifi_frequency_mhz(ap->band, ap->channel);
+
+			if (freq == 0) {
+				print(ctx, "        channel %u frequency undetermined "
+					   "(band %u unrecognised for this channel)",
+				      ap->channel, ap->band);
+			} else {
+				print(ctx, "        channel %u frequency %u MHz band %s",
+				      ap->channel, freq, wifi_band_str(ap->band));
+			}
+		}
 	}
 }
 

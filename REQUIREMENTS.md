@@ -83,7 +83,7 @@ Cell observations, matching the ground-fix `lte[]` array:
 | `eci` | E-UTRAN cell ID | identified cells |
 | `tac` | Tracking area code | identified cells |
 | `earfcn` | Carrier frequency | all cells |
-| `pci` | Physical cell ID | all cells |
+| `pci` | Physical cell ID | **neighbors only** — see FW-1 |
 | `rsrp`, `rsrq` | Signal power / quality | all cells |
 | `adv` | Timing advance — **not engineered for**, see FW-3; usually absent | serving cell only |
 | `nmr[]` | Neighbor measurements — `pci`, `earfcn`, `rsrp`, `rsrq`, `timeDiff` | neighbors |
@@ -105,23 +105,59 @@ modules). All paths below are repo-relative. Target board: `thingy91x_nrf9151_ns
 
 `app/src/modules/location/location.h` drops fields we need:
 
-- **`struct location_wifi_ap_info`** has only `rssi`, `mac`, `mac_length`. Add **`channel`**,
-  **`frequency`** (MHz), and **`band`**. (Do not add SSID.)
-- **`struct location_cell_info`** — used for the serving cell *and* every entry of `gci_cells[]` —
-  has no PCI. Add **`phys_cell_id`**. (`location_neighbor_cell_info` already has it.)
+- **`struct location_wifi_ap_info`** has only `rssi`, `mac`, `mac_length`. Add **`channel`** and
+  **`band`**. (Do not add SSID.)
 
-Plumb both through `location.c`'s event handler and the copy logic in
-`app/src/modules/cloud/cloud_location.c:23-83` (`cellular_cell_data_construct`,
-`wifi_ap_data_construct`), which currently drops the same fields.
+  **`frequency` is derived, not stored.** `struct wifi_scan_result` reports channel and band but
+  never a frequency, and frequency is a pure function of the two, so storing it would cost two
+  bytes per AP to hold a value that can always be recomputed. The firmware derives it for display
+  and the host decoder applies the same mapping to emit the ground-fix `frequency` field. `band` is
+  captured alongside `channel` because channel numbers repeat across bands, so only the pair
+  identifies a frequency.
+
+- **`struct location_cell_info`** — used for the serving cell *and* every entry of `gci_cells[]` —
+  has no PCI. **Deliberately left that way.** `mcc`/`mnc`/`eci`/`tac` already identify those cells
+  globally, so PCI adds nothing a lookup can use, and adding the field would mean editing an
+  upstream struct for no gain. Neighbors in `nmr[]` have no identity and *do* carry `pci`
+  (`location_neighbor_cell_info` already has it) — it is the only thing distinguishing them.
+
+  Accepted consequence: without PCI on GCI cells there is no way to build a PCI→ECI map, so
+  `nmr[]` neighbors in DEEP records cannot be retroactively resolved to identified cells. Judged
+  recoverable later if it ever matters.
+
+Plumb the Wi-Fi fields through `location.c`'s event handler (`copy_wifi_data()` in
+`location_helper.c`) and the copy logic in `app/src/modules/cloud/cloud_location.c`
+(`wifi_ap_data_construct`), which currently drops them.
 
 `struct location_cloud_request_data` already carries `current_cell`, `neighbor_cells[]`,
 `gci_cells[]`, and `wifi_aps[]` — **reuse it as the capture payload.** Do not define a parallel
 struct.
 
 Existing caps are acceptable and need **no change**: `CONFIG_APP_LOCATION_WIFI_APS_MAX`=10,
-`CONFIG_APP_LOCATION_NEIGHBOR_CELLS_MAX`=10, `CONFIG_NRF_WIFI_SCAN_MAX_BSS_CNT`=10,
+`CONFIG_APP_LOCATION_NEIGHBOR_CELLS_MAX`=8, `CONFIG_NRF_WIFI_SCAN_MAX_BSS_CNT`=10,
 `CONFIG_LOCATION_METHOD_WIFI_SCANNING_RESULTS_MAX_CNT`=10. Note in docs that dense urban
 environments will exceed 10 visible APs and be truncated — an accepted tradeoff.
+
+#### Open question (found during CP2): Wi-Fi is 2.4 GHz only
+
+`app/boards/thingy91x_nrf9151_ns.overlay` declares the companion radio as `nordic,nrf7000-spi`.
+The nRF7000 is the 2.4 GHz, scan-only variant, so Zephyr resolves the band choice to
+`CONFIG_NRF_WIFI_2G_BAND=y` and **the device can never observe a 5 GHz or 6 GHz access point.**
+Confirmed on target: a bench scan returned 10 APs, all 2.4 GHz, while a host scan from the same
+spot saw numerous 5 GHz and one 6 GHz network.
+
+This matters because Wi-Fi is capture priority #1. In a dense environment 5 GHz APs are a large
+share of what is visible, and they are the more useful ones for locationing — shorter range means
+tighter position bounds. As configured we systematically miss them.
+
+Not changed in CP2, which only plumbs the fields. To decide before large-scale collection: whether
+to declare the part as `nordic,nrf7002-spi` (Thingy:91 X does carry an nRF7002) and accept the
+longer scan time and higher power, or accept 2.4 GHz-only and record the limitation as a property
+of the dataset. Either way the frequency derivation already handles all three bands.
+
+A second pre-filter is also active and **conflicts with FW-5's "do not pre-filter on device"**:
+`CONFIG_WIFI_NRF70_SKIP_LOCAL_ADMIN_MAC=y` drops APs with locally-administered BSSIDs before the
+application sees them. Decide whether to set it to `n` for capture builds.
 
 ### FW-2 — Two capture profiles
 
@@ -444,7 +480,7 @@ hardware**. `native_sim` proofs are the gate for merging; on-target proofs are r
 |---|---|---|---|
 | **CP0** ✅ | Environment + baseline + `scripts/run_unit_tests.sh`. No functional change. | **Done.** Baseline builds for `thingy91x/nrf9151/ns` (`merged.hex` produced); `scripts/run_unit_tests.sh` = **11/11 passed, 0 filtered**. Baseline size: **text 400,640 / data 155,473 / bss 190,982**. | Flash unmodified app, confirm it boots |
 | **CP1** ✅ | `survey` shell group + `CONFIG_APP_SURVEY` (default n); `show` prints observations from the **existing** pipeline (no new fields yet). Adds `LOCATION_SCAN_SEARCH_TRIGGER` + `CONFIG_APP_LOCATION_SCAN_TRIGGER` to the location module. | **Done.** `tests/module/survey` = **29/29**; `tests/module/location` extended with 4 tests for the new trigger. Survey-off build **byte-identical to CP0** (text 400,640 / data 155,473 / bss 190,982); survey-on +2,276 text / +2,376 bss, RAM 83.3%. Both produce `merged.hex`. | `survey selftest` first (no radio needed), then `survey scan` → `survey show` prints real cells + APs; `survey gnss` → `survey show` prints a fix |
-| **CP2** | FW-1 struct fields: `channel`/`frequency`/`band` on Wi-Fi, `phys_cell_id` on cells; plumbed through `location.c` and `cloud_location.c` | Unit test in `tests/module/location/`: inject a fake Location event with known channel/freq/PCI, assert they survive onto the zbus message | `survey show` now displays channel/freq/band/PCI; cross-check against an independent Wi-Fi scan |
+| **CP2** ✅ | FW-1 struct fields: `channel` + `band` on Wi-Fi, plumbed through `location_helper.c` and `cloud_location.c`; `frequency` derived for display. No cell-struct change — PCI deliberately omitted on identified cells. | **Done.** `tests/module/survey` = **33/33** (frequency derivation across 2.4/5 GHz, absent channel, unrecognised band, channel-outside-band); `tests/module/location` Wi-Fi verifier asserts `channel`/`band` survive onto the zbus message. Survey build FLASH 65.63% / RAM 79.11%; default build also verified so the `cloud_location.c` path is compiled. Storage pipe raised 512→576 (`struct location_msg` grew 492→512, +4 header = 516 required). | **Done.** `survey selftest` renders `channel 6 frequency 2437 MHz band 2.4GHz`; real scan returned 9 APs with channels 1/4/6/11 → 2412/2427/2437/2462 MHz, channels cross-checked against an independent host Wi-Fi scan |
 | **CP3** | FW-5 CBOR encoder + CDDL + `version` field | Unit test: encode → decode round-trip; assert absent fields are **absent, not zero**; assert size ≤ 700 B with 10 APs + 10 neighbors and **record the measured size** | `survey hex` + `survey selftest` prints PASS |
 | **CP4** | HOST-1 decoder (reads CP3 output) | Golden-file test: fixture CBOR → expected JSON. Feed it the exact bytes from CP3's unit test so encoder and decoder are proven against each other | Decode a real `survey hex` dump from the device |
 | **CP5** | FW-6 storage: new record type, LittleFS backend, grown partition | Unit test: store N records, read back, assert count and content. Assert configured full-behaviour at capacity | `survey stats`; store records, power-cycle, confirm count survives |
@@ -538,8 +574,13 @@ beside it is the point of the dataset, so the clock is load-bearing. `date_time`
 modem NITZ time, verified present on target — `AT+CCLK?` returns a timezone offset, which
 NTP cannot supply. NTP only fires when NITZ is absent and the clock has gone stale.
 
-Better still, and not yet implemented: a GNSS fix carries UTC in its PVT frame, so the
-survey module could call `date_time_set()` and stop depending on the network for time.
+The GNSS fix itself is already a time source: `apply_gnss_time()` in `location.c` calls
+`date_time_set()` from the PVT frame's UTC on every fix that reports valid datetime, so the
+device does not depend on
+the network for time once it has seen the sky. Two consequences for record assembly: the
+clock can be **stepped mid-record**, so a record's time base is not guaranteed monotonic
+across its own timestamps, and the PVT sub-second field is discarded — `date_time_set()` is
+fed whole seconds. Both are open questions for the record schema (FW-5).
 
 ### Raw GNSS (`NRF_CLOUD_AGNSS=n`)
 
