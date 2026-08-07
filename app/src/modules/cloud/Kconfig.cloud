@@ -16,6 +16,30 @@ config APP_CLOUD_SHELL
 	help
 	  Enable cloud shell commands.
 
+config APP_CLOUD_LOCATION
+	bool "Send location data to nRF Cloud"
+	depends on APP_LOCATION
+	default y
+	help
+	  Send GNSS position, and cell and Wi-Fi observations, to nRF Cloud.
+
+	  Disable for applications that must never resolve a position from cell or Wi-Fi
+	  data. The code that calls nrf_cloud_coap_location_get() is then not built, so
+	  the request cannot be made even by a device that holds valid credentials.
+
+config APP_CLOUD_PROVISIONING
+	bool "nRF Cloud provisioning"
+	depends on NRF_PROVISIONING
+	default y
+	help
+	  Enter the provisioning state when nRF Cloud reports that the device is not
+	  authenticated.
+
+	  Disable for devices that are deliberately never provisioned. Provisioning
+	  requires offline LTE functional mode, so entering the state cancels any ongoing
+	  location search; and with nothing able to complete provisioning the module would
+	  wait in that state for the rest of the boot.
+
 config APP_CLOUD_PAYLOAD_BUFFER_MAX_SIZE
 	int "Payload maximum buffer size"
 	default 128

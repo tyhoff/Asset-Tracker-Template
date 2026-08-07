@@ -484,13 +484,13 @@ static int send_storage_data_to_cloud(const struct storage_data_item *item)
 	}
 #endif /* CONFIG_APP_ENVIRONMENTAL */
 
-#if defined(CONFIG_APP_LOCATION)
+#if defined(CONFIG_APP_CLOUD_LOCATION)
 	if (item->type == STORAGE_TYPE_LOCATION) {
 		const struct location_msg *loc = &item->data.LOCATION;
 
 		return cloud_location_handle_message(loc);
 	}
-#endif /* CONFIG_APP_LOCATION && CONFIG_LOCATION_METHOD_GNSS */
+#endif /* CONFIG_APP_CLOUD_LOCATION */
 
 	LOG_WRN("Unknown storage data type: %d", item->type);
 
@@ -705,6 +705,11 @@ static void handle_cloud_channel_message(struct cloud_state_object const *state_
 		}
 		break;
 	case CLOUD_PROVISIONING_REQUEST:
+		if (!IS_ENABLED(CONFIG_APP_CLOUD_PROVISIONING)) {
+			LOG_WRN("Provisioning is disabled in this build, ignoring request");
+			break;
+		}
+
 		LOG_DBG("Provisioning request received");
 		smf_set_state(SMF_CTX(state_object), &states[STATE_PROVISIONING]);
 		break;
@@ -834,7 +839,7 @@ static enum smf_state_result state_disconnected_run(void *obj)
 		}
 	}
 
-#if defined(CONFIG_NRF_CLOUD_AGNSS) && defined(CONFIG_APP_LOCATION)
+#if defined(CONFIG_NRF_CLOUD_AGNSS) && defined(CONFIG_APP_CLOUD_LOCATION)
 	if (state_object->chan == &location_chan) {
 		const struct location_msg *msg = (const struct location_msg *)state_object->msg_buf;
 
@@ -844,7 +849,7 @@ static enum smf_state_result state_disconnected_run(void *obj)
 			return SMF_EVENT_HANDLED;
 		}
 	}
-#endif /* CONFIG_NRF_CLOUD_AGNSS && CONFIG_APP_LOCATION */
+#endif /* CONFIG_NRF_CLOUD_AGNSS && CONFIG_APP_CLOUD_LOCATION */
 
 	return SMF_EVENT_PROPAGATE;
 }
@@ -874,7 +879,7 @@ static enum smf_state_result state_connecting_run(void *obj)
 		}
 	}
 
-#if defined(CONFIG_NRF_CLOUD_AGNSS) && defined(CONFIG_APP_LOCATION)
+#if defined(CONFIG_NRF_CLOUD_AGNSS) && defined(CONFIG_APP_CLOUD_LOCATION)
 	if (state_object->chan == &location_chan) {
 		const struct location_msg *msg = (const struct location_msg *)state_object->msg_buf;
 
@@ -884,7 +889,7 @@ static enum smf_state_result state_connecting_run(void *obj)
 			return SMF_EVENT_HANDLED;
 		}
 	}
-#endif /* CONFIG_NRF_CLOUD_AGNSS && CONFIG_APP_LOCATION */
+#endif /* CONFIG_NRF_CLOUD_AGNSS && CONFIG_APP_CLOUD_LOCATION */
 
 	return SMF_EVENT_PROPAGATE;
 }
@@ -918,7 +923,15 @@ static enum smf_state_result state_connecting_provisioned_run(void *obj)
 			(const struct priv_cloud_msg *)state_object->msg_buf;
 
 		if (msg->type == CLOUD_NOT_AUTHENTICATED) {
-			smf_set_state(SMF_CTX(state_object), &states[STATE_PROVISIONING]);
+			/* With provisioning disabled nothing can obtain credentials, so an
+			 * unauthorized connection is simply a failed one. Entering
+			 * STATE_PROVISIONING would cancel any ongoing location search and
+			 * then wait indefinitely for a completion event that cannot come.
+			 */
+			smf_set_state(SMF_CTX(state_object),
+				      IS_ENABLED(CONFIG_APP_CLOUD_PROVISIONING) ?
+					      &states[STATE_PROVISIONING] :
+					      &states[STATE_CONNECTING_BACKOFF]);
 
 			return SMF_EVENT_HANDLED;
 		} else if (msg->type == CLOUD_CONNECTION_SUCCESS) {
@@ -1116,9 +1129,9 @@ static void state_connected_ready_entry(void *obj)
 		return;
 	}
 
-#if defined(CONFIG_NRF_CLOUD_AGNSS) && defined(CONFIG_APP_LOCATION)
+#if defined(CONFIG_NRF_CLOUD_AGNSS) && defined(CONFIG_APP_CLOUD_LOCATION)
 	cloud_location_agnss_process_cached();
-#endif /* CONFIG_NRF_CLOUD_AGNSS && CONFIG_APP_LOCATION */
+#endif /* CONFIG_NRF_CLOUD_AGNSS && CONFIG_APP_CLOUD_LOCATION */
 }
 
 static enum smf_state_result state_connected_ready_run(void *obj)
@@ -1165,7 +1178,7 @@ static enum smf_state_result state_connected_ready_run(void *obj)
 		return SMF_EVENT_HANDLED;
 	}
 
-#if defined(CONFIG_APP_LOCATION)
+#if defined(CONFIG_APP_CLOUD_LOCATION)
 	if (state_object->chan == &location_chan) {
 		const struct location_msg *msg = (const struct location_msg *)state_object->msg_buf;
 
@@ -1177,7 +1190,7 @@ static enum smf_state_result state_connected_ready_run(void *obj)
 
 		return SMF_EVENT_HANDLED;
 	}
-#endif /* CONFIG_APP_LOCATION */
+#endif /* CONFIG_APP_CLOUD_LOCATION */
 
 	return SMF_EVENT_PROPAGATE;
 }
@@ -1218,7 +1231,7 @@ static enum smf_state_result state_connected_paused_run(void *obj)
 		}
 	}
 
-#if defined(CONFIG_NRF_CLOUD_AGNSS) && defined(CONFIG_APP_LOCATION)
+#if defined(CONFIG_NRF_CLOUD_AGNSS) && defined(CONFIG_APP_CLOUD_LOCATION)
 	if (state_object->chan == &location_chan) {
 		const struct location_msg *msg = (const struct location_msg *)state_object->msg_buf;
 
@@ -1228,7 +1241,7 @@ static enum smf_state_result state_connected_paused_run(void *obj)
 			return SMF_EVENT_HANDLED;
 		}
 	}
-#endif /* CONFIG_NRF_CLOUD_AGNSS && CONFIG_APP_LOCATION */
+#endif /* CONFIG_NRF_CLOUD_AGNSS && CONFIG_APP_CLOUD_LOCATION */
 
 	if (state_object->chan == &storage_chan) {
 		const struct storage_msg *msg = (const struct storage_msg *)state_object->msg_buf;

@@ -42,6 +42,10 @@ target_link_options(app PRIVATE --whole-archive)
 
 # Options that cannot be passed through Kconfig fragments
 target_compile_definitions(app PRIVATE
+	# Both default y in Kconfig. Set here so the provisioning and cloud-location
+	# paths stay under test; the survey overlay is what turns them off.
+	-DCONFIG_APP_CLOUD_PROVISIONING=1
+	-DCONFIG_APP_CLOUD_LOCATION=1
 	-DCONFIG_APP_CLOUD_PAYLOAD_BUFFER_MAX_SIZE=256
 	-DCONFIG_APP_CLOUD_SHADOW_RESPONSE_BUFFER_MAX_SIZE=512
 	-DCONFIG_APP_CLOUD_LOG_LEVEL=4
