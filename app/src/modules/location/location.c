@@ -428,7 +428,11 @@ static enum smf_state_result state_location_search_active_run(void *obj)
 		    location_msg->type == LOCATION_GNSS_SEARCH_TRIGGER ||
 		    (IS_ENABLED(CONFIG_APP_LOCATION_SCAN_TRIGGER) &&
 		     location_msg->type == LOCATION_SCAN_SEARCH_TRIGGER)) {
-			LOG_DBG("Location trigger received while active, ignoring");
+			/* Warning, not debug: a GNSS request can hold the module for
+			 * minutes, and a caller whose trigger was dropped would otherwise
+			 * have no indication and would read a stale result as fresh.
+			 */
+			LOG_WRN("Location trigger received while a search is active, ignoring");
 		} else if (location_msg->type == LOCATION_SEARCH_CANCEL) {
 			LOG_DBG("Location search cancel received, cancelling location request");
 

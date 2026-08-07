@@ -65,7 +65,13 @@ static int trigger_publish(const struct shell *sh, enum location_msg_type type, 
 		return err;
 	}
 
-	shell_print(sh, "%s requested. Wait %s, then run \"survey show\".", what, how_long);
+	/* The location module drops a trigger that arrives while a search is already
+	 * running, and publishing to zbus succeeds either way, so this command cannot
+	 * report that outcome directly. Point at the log, where it is now a warning.
+	 */
+	shell_print(sh, "%s requested. Wait %s, then run \"survey show\". If a search is "
+			"already running this trigger is dropped and a warning is logged.",
+		    what, how_long);
 	return 0;
 }
 
@@ -84,7 +90,7 @@ static int cmd_survey_gnss(const struct shell *sh, size_t argc, char **argv)
 	ARG_UNUSED(argv);
 
 	return trigger_publish(sh, LOCATION_GNSS_SEARCH_TRIGGER, "GNSS-only fix",
-			       "up to 60 s outdoors, longer from cold");
+			       "seconds once warm, up to 10 minutes from cold");
 }
 
 static int cmd_survey_show(const struct shell *sh, size_t argc, char **argv)
