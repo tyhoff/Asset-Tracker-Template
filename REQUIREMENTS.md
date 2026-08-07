@@ -138,26 +138,42 @@ Existing caps are acceptable and need **no change**: `CONFIG_APP_LOCATION_WIFI_A
 `CONFIG_LOCATION_METHOD_WIFI_SCANNING_RESULTS_MAX_CNT`=10. Note in docs that dense urban
 environments will exceed 10 visible APs and be truncated — an accepted tradeoff.
 
-#### Open question (found during CP2): Wi-Fi is 2.4 GHz only
+#### Wi-Fi must scan both bands (fixed during CP2)
 
-`app/boards/thingy91x_nrf9151_ns.overlay` declares the companion radio as `nordic,nrf7000-spi`.
-The nRF7000 is the 2.4 GHz, scan-only variant, so Zephyr resolves the band choice to
-`CONFIG_NRF_WIFI_2G_BAND=y` and **the device can never observe a 5 GHz or 6 GHz access point.**
-Confirmed on target: a bench scan returned 10 APs, all 2.4 GHz, while a host scan from the same
-spot saw numerous 5 GHz and one 6 GHz network.
+`app/boards/thingy91x_nrf9151_ns.conf` sets `CONFIG_NRF_WIFI_2G_BAND=y` to keep scan time down for
+the asset tracker. The effect on a survey is that **5 GHz access points are invisible**, which
+biases the highest-value observation — 5 GHz APs are numerous and are the better locationing
+reference, since shorter range means a tighter position bound.
 
-This matters because Wi-Fi is capture priority #1. In a dense environment 5 GHz APs are a large
-share of what is visible, and they are the more useful ones for locationing — shorter range means
-tighter position bounds. As configured we systematically miss them.
+`overlay-survey.conf` therefore sets `CONFIG_NRF_WIFI_ALL_BAND=y`. This is purely a Kconfig
+override; no devicetree change is involved, and the board files are untouched. Note the board
+overlay's `nordic,nrf7000-spi` compatible is *not* what restricted the band — `NRF70_2_4G_ONLY`,
+the only symbol that steers the band choice, is `def_bool y if WIFI_NRF7001` and was never set. The
+compatible only defaults the usage mode to scan-only, which is wanted, so it stays as it is.
 
-Not changed in CP2, which only plumbs the fields. To decide before large-scale collection: whether
-to declare the part as `nordic,nrf7002-spi` (Thingy:91 X does carry an nRF7002) and accept the
-longer scan time and higher power, or accept 2.4 GHz-only and record the limitation as a property
-of the dataset. Either way the frequency derivation already handles all three bands.
+Measured at one bench position: 10 APs before, all 2.4 GHz; 10 APs after, of which 3 were 5 GHz
+(channels 116 and 157, cross-checked against a host scan). Flash and RAM unchanged.
 
-A second pre-filter is also active and **conflicts with FW-5's "do not pre-filter on device"**:
-`CONFIG_WIFI_NRF70_SKIP_LOCAL_ADMIN_MAC=y` drops APs with locally-administered BSSIDs before the
-application sees them. Decide whether to set it to `n` for capture builds.
+`CONFIG_LOCATION_REQUEST_DEFAULT_WIFI_TIMEOUT` is raised from the board conf's 5000 to 30000. The
+5 s budget was sized for a 2.4 GHz-only sweep; scanning both bands adds roughly sixteen DFS channels
+that must be dwelled on passively. This matters more than it looks: the nRF70 offloads the scan and
+emits **all** results only once the full sweep completes, so exceeding the timeout cancels the scan
+and yields `wifi_cnt = 0` rather than a truncated list — the request then proceeds with cellular
+data only and the record looks like a place with no visible Wi-Fi. 30000 matches the Location
+library default and the driver's own scan timeout, and costs nothing when the scan completes
+normally.
+
+`CONFIG_WIFI_NRF70_SKIP_LOCAL_ADMIN_MAC` is set to `n`; the board conf enables it. It drops APs with
+locally-administered BSSIDs on the assumption they are virtual interfaces co-located with a real
+one — a pre-filter on raw data, which FW-5 forbids.
+
+**Consequence for FW-6:** the 10-AP cap now binds harder, and its bias is worse than a plain
+truncation. The RPU keeps an RSSI-ranked list capped at `CONFIG_NRF_WIFI_DISPLAY_SCAN_BSS_LIMIT`
+(10) and replaces weaker entries as it scans, so what survives is the strongest 10 — and 5 GHz APs
+are weaker at equal range, so a strongest-10 filter systematically under-represents the band just
+added. Raise `NRF_WIFI_DISPLAY_SCAN_BSS_LIMIT`, `NRF_WIFI_SCAN_MAX_BSS_CNT`,
+`LOCATION_METHOD_WIFI_SCANNING_RESULTS_MAX_CNT` and `APP_LOCATION_WIFI_APS_MAX` together when sizing
+the record, and `CONFIG_NRF_WIFI_CTRL_HEAP_SIZE` with them.
 
 ### FW-2 — Two capture profiles
 

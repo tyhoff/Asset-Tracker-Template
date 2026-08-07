@@ -147,7 +147,10 @@ not measured:
 - At most `CONFIG_APP_LOCATION_WIFI_APS_MAX` (10) access points and
   `CONFIG_APP_LOCATION_NEIGHBOR_CELLS_MAX` (8) neighbor cells are recorded. Dense urban
   environments will exceed this and be truncated — an accepted tradeoff. Analysis of dense-area
-  captures should account for it.
+  captures should account for it. The cap binds harder now that both bands are scanned and
+  locally-administered BSSIDs are kept. The bias is not random: the radio keeps an RSSI-ranked list
+  and replaces weaker entries as it scans, so the surviving 10 are the strongest — and 5 GHz APs are
+  weaker at equal range, so they are the ones most likely to be dropped.
 - Timing advance (`adv`) is only measured while the modem is RRC-connected, which this application
   does not stay in. It is passed through when the modem happens to report a valid value and reported
   as `absent` otherwise. It should be treated as usually unavailable.
@@ -159,6 +162,14 @@ not measured:
 | `CONFIG_APP_SURVEY` | Enable the module. Default `n`. |
 | `CONFIG_APP_SURVEY_SHELL` | Register the `survey` command group. Default `y`. |
 | `CONFIG_APP_SURVEY_LOG_LEVEL` | Module log level. |
+
+Set by `overlay-survey.conf` and relevant to what a capture contains:
+
+| Option | Purpose |
+|---|---|
+| `CONFIG_NRF_WIFI_ALL_BAND` | Scan 5 GHz as well as 2.4 GHz. The board conf restricts to 2.4 GHz. |
+| `CONFIG_LOCATION_REQUEST_DEFAULT_WIFI_TIMEOUT` | 30 s. A dual-band sweep does not fit the board conf's 5 s, and an overrun returns **no** APs at all. |
+| `CONFIG_WIFI_NRF70_SKIP_LOCAL_ADMIN_MAC=n` | Keep locally-administered BSSIDs instead of dropping them. |
 
 Enabling `CONFIG_APP_SURVEY` selects `CONFIG_APP_LOCATION_SCAN_TRIGGER` in the location module,
 which is what handles the scan-only request.
