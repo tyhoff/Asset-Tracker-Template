@@ -304,17 +304,79 @@ mechanism. Do not write a new one.
 - Behaviour when full must be explicit, configurable, and loudly logged: **stop** (preserve oldest)
   vs **wrap**. Default **stop** — silent data loss would corrupt a study.
 
-Expected capacity at ~600 B/record (10 APs, 10 neighbors, no SSID; ~75% usable after filesystem
-and framing overhead):
+**Measured capacity (CP5, built and asserted).** The estimate below the strikethrough was close on
+records but wrong about the mechanism, so the derivation is worth stating exactly.
 
-| Partition | Records | @10 s | @30 s |
-|---|---|---|---|
-| 1 MiB (current) | ~1,300 | 3.6 h | 11 h |
-| 8 MiB | ~10,500 | 29 h | 87 h |
-| 24 MiB | ~31,000 | 3.6 days | 10 days |
+The LittleFS backend does not pack records end to end. It writes each type at a **fixed stride** of
+`data_size` bytes and never lets an entry straddle a block, so a variable-length record occupies a
+fixed slot and the per-block waste is `block_size % slot_size`. That makes the slot size a real
+design choice rather than a rounding of the record size:
 
-An 8-hour driving day at 10 s cadence ≈ 2,880 records ≈ 1.7 MB. DEEP records are ~1.0 KB.
-**Verify the real figure by measuring encoded size** rather than trusting this estimate.
+- Slot = **816 B** (`uint32_t len` + 812 B payload). At the 4096 B erase block that is **5 slots per
+  block, 4080/4096 used — 0.4 % waste**. Rounding the slot to a tidy 1024 B would fit 4 per block
+  and throw away 20 % of the partition, roughly a day of driving.
+- Payload 812 B ≥ the 700 B record budget (`survey_store.c` BUILD_ASSERTs this; the measured DEEP
+  record is 583 B).
+
+**The binding resource is blocks, not bytes.** The backend keeps **one file per block** —
+`get_file_index()` is `index / entries_per_block`, and `create_storage_file_path()` turns that into
+`SURVEY_<n>.bin`. So *N* records cost *N*/5 **files**, each holding 4080 of a block's 4096 bytes and
+each consuming a whole block, plus the LittleFS directory metadata for every one of those entries.
+
+- Partition **24 MiB** = 6144 blocks.
+- 25,000 records → **5,000 files → 5,000 data blocks**, plus directory metadata pairs for 5,000
+  entries in one directory (order 200–250 blocks), the superblock pair, and free blocks for
+  copy-on-write and `block-cycles` relocation. Roughly **15 % spare**.
+- `CONFIG_APP_STORAGE_MAX_RECORDS_PER_TYPE=25000`.
+
+**One data block per file only holds while the file stays under 4088 bytes.** LittleFS keeps a file
+in a single block only up to `block_size - 8` — the CTZ skip-list reserves two 4-byte pointers — so
+the 16 bytes that 816 B slots leave at the end of each block are not slack, they are what keeps each
+file single-block. 4080 clears 4088 by **eight bytes**. A slot size chosen to pack the block harder
+(819 B → 4095 of 4096, which looks strictly better on a waste-percentage basis) would put every file
+on two blocks and double the partition's block cost. The margin is documented at
+`SURVEY_STORE_SLOT_SIZE` in `survey_store.h`; anyone retuning the slot size has to re-check it.
+
+The backend's own `verify_partition_size()` **cannot** check this. It computes
+`ceil(data_size × RECORDS_PER_TYPE / block_size)` — densely packed records — plus a flat 3 blocks,
+which for 30,000 records gives 5,980 of 6,144 and passes. The real cost of 30,000 records is 6,000
+data blocks *before* any metadata, so a configuration that passes the assert at boot can still run
+LittleFS out of blocks mid-drive. That is why the cap is 25,000 rather than the 30,705 slots the
+byte arithmetic suggests.
+
+| Cadence | Records/day | Days of data |
+|---|---|---|
+| 10 s | 8,640 | **2.9** |
+| 20 s | 4,320 | **5.8** |
+| 30 s | 2,880 | **8.7** |
+
+**A week of data therefore requires a capture interval of about 25 s or slower.** This is a
+constraint on FW-7/CP6, not a footnote: at 10 s this partition fills over a long weekend, and with
+`FULL_STOP` configured the device then stops recording rather than eating the start of the run.
+
+~~Expected capacity at ~600 B/record (~75% usable after filesystem and framing overhead): 1 MiB ≈
+1,300 records; 8 MiB ≈ 10,500; 24 MiB ≈ 31,000.~~ The 24 MiB figure was wrong for two reasons that
+happened to partly cancel: the 600 B record guess and the 75 % overhead guess, and then the
+one-file-per-block layout that neither accounted for.
+
+**Open questions for on-target verification.**
+
+1. **Metadata cost is estimated, not measured.** The 200–250 blocks for 5,000 directory entries is
+   arithmetic on LittleFS's metadata-pair layout, not an `fs_statvfs()` reading. Fill the partition
+   on target and check the free-block count before trusting the 15 % margin. **Treat this as a gate
+   on the 25,000 figure, not a nice-to-have** — review's position was that 25,000 is defensible only
+   once measured, and that **20,000** (4,000 files, ~32 % free, a clean 7 days at 30 s) is the number
+   to fall back to if the measurement is worse than the arithmetic.
+
+   Not an open question: Partition Manager does **not** own this layout. The build generates no
+   `partitions.yml`, and `build-survey/app/zephyr/zephyr.dts` shows `littlefs_storage` at
+   `reg = <0x4d2000 0x1800000>` sourced from `overlay-survey.overlay`, with the `zephyr,fstab`
+   node pointing at it. The overlay is what takes effect.
+2. **Store latency as the partition fills.** 5,000 files in one directory, and `fs_open()` does a
+   directory lookup on every store. The header files are held open precisely because LittleFS
+   metadata replay is O(N) (see the comment at the top of `littlefs_backend.c`), but the *data*
+   files are opened and closed per record. If this turns out to matter, the fix is in the backend's
+   file layout, not in the slot size.
 
 ### FW-7 — Cadence
 
@@ -477,13 +539,22 @@ A `survey` shell command group is checkpoint CP1 — ahead of all data-format an
 | `survey clear` | discard the cached observation | CP1 ✅ |
 | `survey selftest` | render a synthetic observation; needs no radio | CP1 ✅ |
 | `survey hex` | hexdump the encoded CBOR of the **cached** observation — proves the encoder without a host | CP3 ✅ |
-| `survey hex <n>` | hexdump a **stored** record by index; needs somewhere to store one | CP5 |
+| `survey store` | encode the cached observation and commit it to flash | CP5 ✅ |
+| `survey hex <n>` | hexdump a **stored** record by index | CP8 — see below |
 | `survey timing` | last measured durations for GNSS / cell / Wi-Fi steps | CP7 |
 | `survey profile <fast\|deep>` | force a profile, bypassing the gating logic | CP7 |
 
 `scan` and `gnss` are separate commands because the Location library treats its method list as a
 **fallback chain and stops at the first method that succeeds** — a request including GNSS returns a
 fix and never scans. This is the same reason FW-2 requires sequenced requests.
+
+**Why `survey hex <n>` moved to CP8.** The storage backend's read interface is `peek` and `retrieve`
+on the head of a FIFO — there is no addressing by index, and the on-flash offset of record *n* is
+only derivable from the type's header offsets, which live behind file handles the storage thread
+owns exclusively. Adding random access at CP5 would mean either a second reader of those handles (a
+real concurrency hazard for a nice-to-have) or a new backend API. CP8's export protocol has to walk
+every stored record anyway, and resume-from-sequence gives it a real reason to address them; that is
+where indexed access belongs. Until then, counts come from the upstream `att storage stats` command.
 
 Verbose per-step logging behind a Kconfig log level, so a field failure can be diagnosed from a
 serial capture alone.
@@ -500,7 +571,7 @@ hardware**. `native_sim` proofs are the gate for merging; on-target proofs are r
 | **CP2** ✅ | FW-1 struct fields: `channel` + `band` on Wi-Fi, plumbed through `location_helper.c` and `cloud_location.c`; `frequency` derived for display. No cell-struct change — PCI deliberately omitted on identified cells. | **Done.** `tests/module/survey` = **33/33** (frequency derivation across 2.4/5 GHz, absent channel, unrecognised band, channel-outside-band); `tests/module/location` Wi-Fi verifier asserts `channel`/`band` survive onto the zbus message. Survey build FLASH 65.63% / RAM 79.11%; default build also verified so the `cloud_location.c` path is compiled. Storage pipe raised 512→576 (`struct location_msg` grew 492→512, +4 header = 516 required). | **Done.** `survey selftest` renders `channel 6 frequency 2437 MHz band 2.4GHz`; real scan returned 9 APs with channels 1/4/6/11 → 2412/2427/2437/2462 MHz, channels cross-checked against an independent host Wi-Fi scan |
 | **CP3** ✅ | FW-5 CBOR encoder + CDDL + `version` field; `survey hex` encodes the cached observation | **Done.** `tests/module/survey_record` = **23/23**, full `tests/module` = **13/13 configurations**. Absent-not-zero asserted per optional field. **Measured worst case: 583 B** (10 APs + 10 neighbours + 3 GCI + both bracket fixes + all six timestamps), asserted against the 700 B budget rather than printed. Survey build text 384,980 / data 148,794 / bss 186,971; default build also verified. | `survey hex` prints a decodable dump |
 | **CP4** ✅ | HOST-1 decoder `scripts/survey_decode.py` (reads CP3 output) | **Done.** `tests/host` = **58/58**, stdlib only. Golden files are the **exact bytes CP3's encoder emitted**, lifted from the suite by `scripts/survey_fixture.py`, so encoder and decoder are proven against each other rather than against two readings of the CDDL — which is how the `time-base` enum disagreement below was caught. Covers indefinite-length CBOR (what zcbor actually emits), version dispatch, RSRP/RSRQ and Wi-Fi frequency conversion, interpolation, and the quality gate. | Decode a real `survey hex` dump from the device |
-| **CP5** | FW-6 storage: new record type, LittleFS backend, grown partition | Unit test: store N records, read back, assert count and content. Assert configured full-behaviour at capacity | `survey stats`; store records, power-cycle, confirm count survives |
+| **CP5** ✅ | FW-6 storage: `SURVEY` record type on the LittleFS backend, 24 MiB partition (`overlay-survey.overlay`), `APP_STORAGE_FULL_STOP`, `survey store` | **Done.** `tests/module/survey_store` = **11 tests × 2 configurations** (`.stop` / `.overwrite`, 0 failures); full `tests/module` = **15/15 configurations**; `tests/host` still **58/58**. The suite drives the real path — `survey_store_publish()` → zbus → storage thread → LittleFS — re-decodes a record read back off flash rather than comparing it to the buffer that wrote it, and reads the ring's offsets back out of the header file *through the filesystem* to show they are on flash rather than cached in RAM. **816 B fixed-stride slot**, chosen to pack the 4096 B erase block 5-up (0.4 % waste). Cap **25,000 records ≈ 2.9 days @ 10 s / 5.8 @ 20 s / 8.7 @ 30 s** — set by the file count, not the byte count; see FW-6 above. Survey build text 412,408 / data 155,998 / bss 191,811 (+27 KB of filesystem code over CP3); default build also verified (text 400,732 / data 155,597 / bss 191,334) since four of the touched files are upstream-owned. Review caught two data-destroying defects, both fixed here: `cloud.c` consumed (deleted) storage records it had no handler for, and `storage.c` re-announced the buffer threshold after a failed store, which under `FULL_STOP` meant one "send now" per capture forever. | **Not yet run** (needs hardware): `att storage stats`, store records, power-cycle, confirm count survives; plus the two measurements FW-6 lists as open — real metadata block cost via `fs_statvfs`, and store latency with 5,000 files in one directory |
 | **CP6** | FW-2/FW-4 paired capture orchestrator: GNSS bracket + scan, all six timestamps | Unit test with faked Location library: assert request **sequence** (GNSS → scan → GNSS), assert no overlap, assert all timestamps populated and ordered | `survey scan` then `survey show` shows two GNSS fixes bracketing the scan; `survey timing` reports real durations |
 | **CP7** | FW-2 profiles FAST/DEEP + gating | Unit test: gating decisions across a speed/power truth table; assert DEEP requests GCI | `survey profile deep` yields multiple full-identity GCI cells; FAST does not |
 | **CP8** | FW-8 export protocol over USB CDC | Unit test: framing, length prefix, checksum, resume-from-sequence | Export to host, verify checksums, interrupt mid-transfer and confirm resume is lossless and non-destructive |

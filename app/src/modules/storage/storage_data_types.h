@@ -23,6 +23,9 @@
 #if IS_ENABLED(CONFIG_APP_LOCATION)
 #include "location.h"
 #endif
+#if IS_ENABLED(CONFIG_APP_SURVEY_STORAGE)
+#include "survey_store.h"
+#endif
 
 /**
  * @brief List of data sources that can be stored by the storage module
@@ -68,9 +71,18 @@
 		   (X(ENVIRONMENTAL, environmental_chan,					\
 		      struct environmental_msg, struct environmental_msg,			\
 		      environmental_check, environmental_extract)))				\
+	/* The survey build stores paired GNSS+radio records of its own and does not want	\
+	 * LOCATION's unpaired ones. Registering both would also blow the LittleFS partition	\
+	 * budget: each type is sized for MAX_RECORDS_PER_TYPE independently, and the survey	\
+	 * sets that count high enough that a second large type will not fit.			\
+	 */											\
 	IF_ENABLED(CONFIG_APP_LOCATION,								\
-		   (X(LOCATION, location_chan, struct location_msg,				\
-		      struct location_msg, location_check, location_extract)))
+		   (IF_DISABLED(CONFIG_APP_SURVEY_STORAGE,					\
+				(X(LOCATION, location_chan, struct location_msg,		\
+				   struct location_msg, location_check, location_extract)))))	\
+	IF_ENABLED(CONFIG_APP_SURVEY_STORAGE,							\
+		   (X(SURVEY, survey_store_chan, struct survey_store_msg,			\
+		      struct survey_store_msg, survey_store_check, survey_store_extract)))
 
 #define STORAGE_DATA_TYPE(_name)								\
 	STORAGE_TYPE_ ## _name

@@ -553,6 +553,18 @@ static int lfs_storage_store(const struct storage_data *type, const void *data, 
 	was_full = ((header.write_offset - header.read_offset) >= RECORDS_PER_TYPE);
 	write_pos = (entry_offset_index % RECORDS_PER_TYPE) * type->data_size;
 
+	/* Reject before opening the file, so a full store is a no-op rather than a partial
+	 * one: the write below and the header update after it are not atomic together, and
+	 * the oldest record is only logically dropped when read_offset moves.
+	 */
+	if (was_full && IS_ENABLED(CONFIG_APP_STORAGE_FULL_STOP)) {
+		LOG_WRN("Storage full for type %s (%d records); dropping new data. "
+			"Stored records are intact -- read them out and clear.",
+			type->name, RECORDS_PER_TYPE);
+
+		return -ENOSPC;
+	}
+
 	/* Open storage file */
 	ret = create_storage_file_path(type, file_index, file_path);
 	if (ret < 0) {

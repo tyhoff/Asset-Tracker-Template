@@ -28,6 +28,38 @@ config APP_SURVEY_SHELL
 	  Register the "survey" shell command group, used to inspect captured
 	  observations and to trigger captures manually from a console.
 
+config APP_SURVEY_STORAGE
+	bool "Store survey records on flash"
+	depends on APP_STORAGE_BACKEND_LITTLEFS
+	depends on !APP_CLOUD_LOCATION
+	help
+	  Register encoded survey records as a storage data type, so a capture
+	  survives power loss and can be read back after a drive.
+
+	  Default n, and set explicitly in overlay-survey.conf rather than
+	  defaulted on by the backend. Turning this on is not a small change: it
+	  removes the LOCATION storage type (below), pushes STORAGE_MAX_DATA_SIZE
+	  to 816 bytes, and so requires the matching APP_STORAGE_BATCH_BUFFER_SIZE
+	  and APP_STORAGE_THREAD_STACK_SIZE that the overlay also sets. A build
+	  that enabled APP_SURVEY just for the shell commands would otherwise
+	  inherit all of that silently.
+
+	  Enabling this also removes the LOCATION storage type from the build: the
+	  survey record already carries the GNSS fix paired with the radio
+	  observations taken at the same moment, whereas LOCATION stores the fix
+	  and the scan as two unrelated records. Both types cannot be registered
+	  at once in any case -- the LittleFS backend reserves
+	  APP_STORAGE_MAX_RECORDS_PER_TYPE records for every registered type, and
+	  the survey sets that high enough to fill the partition on its own.
+
+	  That is why this depends on !APP_CLOUD_LOCATION: cloud.c references
+	  STORAGE_TYPE_LOCATION under that symbol, so enabling both would fail to
+	  compile with an undeclared identifier rather than anything readable.
+
+	  Sizing: each record occupies SURVEY_STORE_SLOT_SIZE bytes on flash
+	  regardless of how much it encodes to. See docs/modules/storage.md and
+	  the note in survey_store.h.
+
 module = APP_SURVEY
 module-str = Survey
 source "subsys/logging/Kconfig.template.log_config"

@@ -353,6 +353,14 @@ static void handle_data_message(const struct storage_state *state_object,
 	err = backend->store(type, (const void *)data, type->data_size);
 	if (err) {
 		LOG_ERR("Failed to store %s data, error: %d", type->name, err);
+
+		/* Nothing was added, so the record count is unchanged and a threshold check
+		 * here could only re-announce a threshold that was already announced. With
+		 * APP_STORAGE_FULL_STOP that repeats on every single capture once the
+		 * partition is full, turning "storage is full" into an endless stream of
+		 * STORAGE_THRESHOLD_REACHED -- which the state machine reads as "send now".
+		 */
+		return;
 	}
 
 	check_and_notify_buffer_threshold(state_object, type);

@@ -538,7 +538,32 @@ static void handle_storage_batch_available(const struct storage_msg *msg)
 
 		err = send_storage_data_to_cloud(&item);
 		if (err) {
-			if (err == -ENOTSUP || err == -EINVAL) {
+			if (err == -ENOTSUP) {
+				/* No handler is compiled in for this type, so nothing was sent.
+				 * Falling through would consume the item and delete it from
+				 * flash -- which is how the survey build, whose records are
+				 * exported over USB rather than uploaded, would lose an entire
+				 * capture the first time it connected. End the session instead
+				 * and leave the data where it is.
+				 *
+				 * This ends the whole session, not just this item, because the
+				 * batch is a FIFO: there is no way to skip the head without
+				 * consuming it. So in a build that mixes handled and unhandled
+				 * types, the unhandled one starves the others -- populate_pipe()
+				 * walks the types in linker order, and once it offers this one
+				 * every session aborts on the first item. That is the accepted
+				 * trade in the survey build, where BATTERY and ENVIRONMENTAL
+				 * uploads are not what the device is for and losing a survey
+				 * capture is. If a build ever needs both, the fix belongs in
+				 * populate_pipe(): skip types with no handler rather than
+				 * offering them and aborting here.
+				 */
+				LOG_WRN("No cloud handler for storage type %d; "
+					"leaving stored data untouched", item.type);
+				session_error = true;
+
+				continue;
+			} else if (err == -EINVAL) {
 				LOG_ERR("Data error sending data (type %d): %d", item.type, err);
 			} else {
 				LOG_WRN("Network error sending data (type %d): %d", item.type, err);

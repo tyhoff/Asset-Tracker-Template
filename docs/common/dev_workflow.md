@@ -62,8 +62,22 @@ Run from the workspace root, inside the toolchain manager.
 nrfutil toolchain-manager launch --ncs-version v3.4.0 -- bash -c '
     cd /Users/tyler/junk/ncs-3.4.0 &&
     west build -b thingy91x/nrf9151/ns --sysbuild -d build-att-survey \
-        ../Asset-Tracker-Template/app -- -DEXTRA_CONF_FILE=overlay-survey.conf
+        ../Asset-Tracker-Template/app -- \
+        -DEXTRA_CONF_FILE=overlay-survey.conf \
+        -DEXTRA_DTC_OVERLAY_FILE=overlay-survey.overlay
 '
+```
+
+Both overlays are required. `overlay-survey.overlay` grows `littlefs_storage` from 1 MiB to 24 MiB,
+which is what `CONFIG_APP_STORAGE_MAX_RECORDS_PER_TYPE=30000` in the `.conf` is sized against.
+Building with the `.conf` alone links and flashes, then fails an `__ASSERT` inside the LittleFS
+backend at boot — the assert message names the block counts, so it is diagnosable, but the device is
+dead until it is reflashed. Confirm the partition took by checking the generated devicetree rather
+than trusting the command line:
+
+```sh
+grep -A3 'littlefs_storage:' build-att-survey/app/zephyr/zephyr.dts
+# reg = < 0x4d2000 0x1800000 >;
 ```
 
 **Default build** — plain asset-tracker, `CONFIG_APP_SURVEY=n`:
@@ -300,6 +314,78 @@ twister left running: a backtrace showing only the idle thread in `hwtimer_tick_
 `scripts/run_unit_tests.sh` runs the container with `--rm`, so `handler.log` and the ELFs vanish with
 it. When you need them afterwards — extracting host fixtures, running gdb, inspecting symbols — run
 the container directly with an output mount as shown above.
+
+### A test that must exist in every build variant
+
+Unity's runner generator scans the **source text** for `void test_*(void)` and emits a call for each
+one it finds. `#if`-ing a test out of the compilation does not remove it from the runner, so the
+build fails at link with `undefined reference to test_...`.
+
+When a suite is built more than once with different options — `tests/module/survey_store` builds
+once per storage full-behaviour — define every test unconditionally and skip at runtime instead:
+
+```c
+if (!IS_ENABLED(CONFIG_APP_STORAGE_FULL_STOP)) {
+	TEST_IGNORE_MESSAGE("FULL_OVERWRITE build; asserted in .stop");
+}
+```
+
+Unity then prints `IGNORE: <reason>` for it, which is checkable: read the per-test output of *all*
+variants and confirm every test PASSes somewhere. A test ignored in every variant looks like a
+passing suite.
+
+The variants themselves come from `extra_args` in `testcase.yaml`, which twister passes to CMake as
+`-D`. Unit tests do not source the application's Kconfig, so an application `choice` symbol has to
+arrive as a `target_compile_definitions` entry selected by that CMake variable.
+
+### Break the code to see whether the test noticed
+
+A test that stores one record into a partition `setUp()` just cleared and then asserts the unused
+tail of the slot is zero passes whether or not the code zeroes anything — the erased flash was
+already zero. The suite looked green and covered nothing.
+
+The cheap check is a mutation: comment out the line the test claims to cover, re-run, confirm it
+fails, put it back.
+
+```sh
+# with the memset in survey_store.c commented out
+src/survey_store_test.c:318:test_the_unused_tail_of_a_slot_is_zeroed:FAIL: Expected 0 Was 159
+```
+
+Worth doing for any test whose expected value is zero, empty, or absent, because that is also what a
+freshly initialised system looks like. The fix for this one was to dirty every slot with a maximal
+record and drain before storing the small record under test.
+
+### native_sim cannot test a data race
+
+Do not write a two-thread test to prove a mutex is needed. `native_sim` advances its simulated clock
+only when no thread is ready to run, and that makes both shapes of the test useless:
+
+- A contender that spins on `k_yield()` keeps the CPU permanently busy, so the main thread's
+  `k_sleep()` never expires. The suite hangs until twister kills it — `failed (rc=-9)`, with the last
+  line of `handler.log` being whichever test ran before it.
+- A contender that sleeps is never runnable during the window the main thread spends inside the
+  function under test, at equal priority and with timeslicing off. It never interleaves.
+
+The second version was written, passed, and then **still passed with the mutex deliberately removed**
+— a green test asserting nothing, which is worse than no test. It was deleted rather than kept.
+Serialisation gets verified by inspection and by documenting the lock ordering (see
+`survey_store.h`), and on target where preemption is real.
+
+The general rule is the one above: if a mutation of the code under test does not turn the test red,
+the test does not cover it. That applies to concurrency tests too, and concurrency is where a test is
+most likely to look convincing while covering nothing.
+
+### Capacity arithmetic on the LittleFS backend
+
+Record capacity is bounded by **blocks, not bytes**. The backend stores one file per block
+(`get_file_index()` is `index / entries_per_block`), so *N* records mean *N*/`entries_per_block`
+files, each consuming a whole erase block plus its directory metadata.
+
+`verify_partition_size()` does **not** check this — it models densely packed records plus a flat 3
+blocks, so it will pass a configuration that later runs the filesystem out of blocks mid-run. Size
+`CONFIG_APP_STORAGE_MAX_RECORDS_PER_TYPE` from the file count and leave real margin. See the FW-6
+section of `REQUIREMENTS.md` for the worked example.
 
 ## Host tests
 

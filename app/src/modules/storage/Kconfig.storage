@@ -50,6 +50,29 @@ config APP_STORAGE_LITTLEFS_MAX_PATH_LEN
 	  Maximum length of file names used by the storage module
 	  in the LittleFS backend.
 
+choice APP_STORAGE_FULL
+	prompt "Behaviour when storage is full"
+	default APP_STORAGE_FULL_OVERWRITE
+	help
+	  What the backend does when a type already holds
+	  APP_STORAGE_MAX_RECORDS_PER_TYPE records and another arrives.
+
+config APP_STORAGE_FULL_OVERWRITE
+	bool "Overwrite the oldest record"
+	help
+	  Keep the newest records and drop the oldest. Correct when the data is a
+	  live view of the device and only the recent past matters.
+
+config APP_STORAGE_FULL_STOP
+	bool "Stop storing and keep what is already stored"
+	help
+	  Reject new records with -ENOSPC once full. Correct when the stored data
+	  is a recording that is collected later: overwriting would silently
+	  discard the beginning of a run, and the loss is invisible until the data
+	  is analysed, which may be days after the device came back.
+
+endchoice # APP_STORAGE_FULL
+
 endif # APP_STORAGE_BACKEND_LITTLEFS
 
 config APP_STORAGE_MAX_TYPES

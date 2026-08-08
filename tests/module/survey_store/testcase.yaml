@@ -1,0 +1,19 @@
+# Built once per full-behaviour. The behaviour is a compile-time choice in the real build
+# too, so testing one of them would leave the other unbuilt as well as unasserted.
+tests:
+  asset_tracker_template.fw.survey_store.stop:
+    extra_args:
+      - SURVEY_STORE_FULL=STOP
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    integration_platforms:
+      - native_sim
+  asset_tracker_template.fw.survey_store.overwrite:
+    extra_args:
+      - SURVEY_STORE_FULL=OVERWRITE
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    integration_platforms:
+      - native_sim

@@ -269,17 +269,24 @@ void survey_record_from_obs(const struct survey_observation *obs, uint32_t seque
 	 */
 }
 
+/* Serialises the scratch buffer inside survey_record_encode(). At file scope because
+ * K_MUTEX_DEFINE places the object in an iterable linker section, which is not a thing to
+ * do at block scope.
+ */
+static K_MUTEX_DEFINE(encode_lock);
+
 int survey_record_encode(const struct survey_record_data *rec, uint8_t *buf, size_t buf_len,
 			 size_t *out_len)
 {
 	/* File scope because the generated struct is ~1.5 kB, far past any shell or
-	 * module thread stack.
+	 * module thread stack -- and therefore shared, which is what encode_lock is for.
 	 *
-	 * NOT thread-safe. Today there is exactly one caller at a time -- "survey hex" on
-	 * the shell thread -- so no lock is needed and none is paid for. The moment CP5's
-	 * storage path becomes a second caller this needs a mutex: two concurrent encodes
-	 * would interleave into this buffer and produce a plausible-looking hybrid record
-	 * with no diagnostic at all.
+	 * CP5 added the second caller this was written in anticipation of: "survey hex"
+	 * runs on the shell thread and the storage path runs wherever the capture
+	 * orchestrator lives. Two concurrent encodes would interleave into this buffer and
+	 * produce a plausible-looking hybrid record with no diagnostic at all. The lock is
+	 * taken here rather than by the callers so that it covers every caller by
+	 * construction.
 	 */
 	static struct survey_record out;
 	int err;
@@ -287,6 +294,8 @@ int survey_record_encode(const struct survey_record_data *rec, uint8_t *buf, siz
 	if (rec == NULL || buf == NULL || out_len == NULL) {
 		return -EINVAL;
 	}
+
+	k_mutex_lock(&encode_lock, K_FOREVER);
 
 	memset(&out, 0, sizeof(out));
 
@@ -317,6 +326,9 @@ int survey_record_encode(const struct survey_record_data *rec, uint8_t *buf, siz
 	}
 
 	err = cbor_encode_survey_record(buf, buf_len, &out, out_len);
+
+	k_mutex_unlock(&encode_lock);
+
 	if (err != ZCBOR_SUCCESS) {
 		/* Distinguish the two, because they call for opposite responses and
 		 * conflating them sends the reader down the wrong path entirely: a short

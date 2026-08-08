@@ -1,0 +1,62 @@
+/*
+ * Copyright (c) 2026 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ *
+ * Survey storage partitioning: grow littlefs_storage from 1 MiB to 24 MiB by taking the
+ * space from external_flash_partition, which the asset-tracker application does not use.
+ *
+ * Why 24 MiB, and why the record cap is well under what the bytes suggest.
+ *
+ * One survey record occupies a fixed 816-byte slot (survey_store.h). The binding resource
+ * is not bytes but *blocks*, because the LittleFS backend stores one file per block --
+ * get_file_index() is `index / entries_per_block` and create_storage_file_path() turns that
+ * into "SURVEY_<n>.bin". At the 4096-byte erase block of the Thingy:91 X external flash 5
+ * slots fit a block, so N records cost N/5 files, each holding 4080 of 4096 bytes and each
+ * consuming a whole block:
+ *   24 MiB = 6144 blocks
+ *   25000 records -> 5000 files -> 5000 data blocks
+ *   plus the directory metadata for 5000 entries in one directory (LittleFS metadata pairs,
+ *   order 200-250 blocks), the superblock pair, and free blocks for copy-on-write and for
+ *   block-cycles relocation
+ * which leaves roughly 15 % of the partition spare. The backend's own
+ * verify_partition_size() cannot check this: it models densely packed records
+ * (data_size * RECORDS_PER_TYPE / block_size) plus a flat 3 blocks, so it would happily
+ * pass a configuration that runs LittleFS out of blocks mid-drive. The metadata figure is
+ * an estimate; the on-target fs_statvfs check is listed as an open item in REQUIREMENTS.md.
+ *
+ * 25000 records buys:
+ *   10 s cadence -> 8640 records/day -> 2.9 days
+ *   20 s cadence -> 4320 records/day -> 5.8 days
+ *   30 s cadence -> 2880 records/day -> 8.7 days
+ * A week of data therefore needs a capture interval of about 25 s or slower. That is a real
+ * constraint on CP6, not a rounding note -- at 10 s this partition fills over a long
+ * weekend, and with FULL_STOP configured it then stops recording rather than eating the
+ * start of the run.
+ *
+ * The remaining 3.18 MiB of external_flash_partition is left in place rather than
+ * deleted: it is the node other overlays and out-of-tree code reference by label, and a
+ * zero-size or missing partition is a harder failure to read than a small one.
+ *
+ * Applied with -DEXTRA_DTC_OVERLAY_FILE=overlay-survey.overlay -- it is NOT implied by
+ * overlay-survey.conf. Building with the conf and without this overlay is caught at boot
+ * by the backend's own partition-size assert rather than silently producing a device that
+ * records for an hour.
+ */
+
+&flash_ext {
+	partitions {
+		/delete-node/ partition@4d2000;
+		/delete-node/ partition@5d2000;
+
+		littlefs_storage: partition@4d2000 {
+			label = "littlefs_storage";
+			reg = <0x004d2000 0x01800000>;
+		};
+
+		external_flash_partition: partition@1cd2000 {
+			label = "external_flash";
+			reg = <0x01cd2000 0x0032e000>;
+		};
+	};
+};

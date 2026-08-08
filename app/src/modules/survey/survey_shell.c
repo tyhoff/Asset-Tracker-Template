@@ -25,6 +25,9 @@
 #include "survey.h"
 #include "survey_obs.h"
 #include "survey_record.h"
+#if defined(CONFIG_APP_SURVEY_STORAGE)
+#include "survey_store.h"
+#endif
 
 /* Guards against a future Kconfig edit that separates the two symbols: without the scan
  * trigger handler compiled into the location module, "survey scan" would publish a
@@ -297,6 +300,49 @@ static int cmd_survey_hex(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+#if defined(CONFIG_APP_SURVEY_STORAGE)
+/* "survey store" -- encode the cached observation and commit it to flash.
+ *
+ * The sequence number restarts at zero every boot. It orders records within one run and
+ * nothing more; the capture orchestrator owns session identity.
+ */
+static uint32_t store_sequence;
+
+static int cmd_survey_store(const struct shell *sh, size_t argc, char **argv)
+{
+	int err;
+
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	survey_obs_snapshot(&scratch.obs);
+
+	if (!scratch.obs.gnss_valid && !scratch.obs.scan_valid) {
+		shell_warn(sh, "Nothing cached. Run \"survey scan\", \"survey gnss\" or "
+			       "\"survey selftest\" first.");
+		return -ENODATA;
+	}
+
+	if (scratch.obs.synthetic) {
+		shell_warn(sh, "Cache holds synthetic data: storing a NON-measurement.");
+	}
+
+	err = survey_store_publish(&scratch.obs, store_sequence);
+	if (err) {
+		shell_error(sh, "Store failed (%d).", err);
+		return err;
+	}
+
+	shell_print(sh, "Record %u handed to storage.", store_sequence);
+	shell_print(sh, "Storage writes asynchronously; \"att storage stats\" reports what "
+			"landed.");
+
+	store_sequence++;
+
+	return 0;
+}
+#endif /* CONFIG_APP_SURVEY_STORAGE */
+
 /* SHELL_CMD_ARG with zero optional arguments, so that a mistyped "survey show 3" reports
  * an error instead of silently ignoring the argument.
  */
@@ -315,6 +361,11 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_survey,
 		      "Render a synthetic observation; needs no radio", cmd_survey_selftest, 1, 0),
 	SHELL_CMD_ARG(hex, NULL,
 		      "Encode the cached observation and hexdump the CBOR", cmd_survey_hex, 1, 0),
+#if defined(CONFIG_APP_SURVEY_STORAGE)
+	SHELL_CMD_ARG(store, NULL,
+		      "Encode the cached observation and store it on flash",
+		      cmd_survey_store, 1, 0),
+#endif
 	SHELL_SUBCMD_SET_END
 );
 

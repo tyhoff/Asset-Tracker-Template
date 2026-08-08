@@ -177,6 +177,29 @@ If the requirement is not met, either grow the partition in `att_flash_partition
 > [!NOTE]
 > The data types are stored in separate files, so the minimum number of flash blocks needed is ∑ data types + 3.
 
+#### Behaviour when full
+
+When a type already holds `CONFIG_APP_STORAGE_MAX_RECORDS_PER_TYPE` records and another arrives, the LittleFS backend does one of two things, chosen at build time:
+
+| **Kconfig** | **Behaviour** | **Use when** |
+| - | - | - |
+| `CONFIG_APP_STORAGE_FULL_OVERWRITE` (default) | Drop the oldest record and store the new one. `store()` returns 0. | The data is a live view of the device and only the recent past matters. This is the historical behaviour. |
+| `CONFIG_APP_STORAGE_FULL_STOP` | Reject the new record with `-ENOSPC` and keep everything already stored. | The data is a recording that is collected later. Overwriting would discard the start of a run, and nothing would notice until analysis. |
+
+Under `FULL_STOP` the backend logs a warning per rejected record and `handle_data_message()` in `storage.c` logs an error; neither is fatal and the module keeps running. Reading records out (or `STORAGE_CLEAR`) makes room again — being full is not a latched state.
+
+The choice applies to every registered type. There is no per-type override.
+
+A failed `store()` also **skips the buffer-threshold check**. Nothing was added, so the count is unchanged and the check could only re-announce a threshold that was already announced — which under `FULL_STOP` would mean one `STORAGE_THRESHOLD_REACHED` per capture, forever, once the partition filled. The state machine reads that message as "send now".
+
+#### Types with no cloud handler
+
+`send_storage_data_to_cloud()` in `cloud.c` returns `-ENOTSUP` for a storage type it has no branch for. The batch drain treats that as **end of session, do not consume**: the record stays on flash.
+
+This matters because consuming is destructive — `STORAGE_BATCH_CONSUME` makes the storage thread `retrieve()` the record, which advances the read offset past it permanently. A type whose data leaves the device by some other route (the survey build exports over USB rather than uploading) would otherwise lose everything it had stored the first time the device connected to the cloud. `-EINVAL`, which means a handler exists and rejected the item as malformed, still consumes; otherwise one bad record would wedge the queue.
+
+Ending the session ends it for **every** type, not just the unhandled one. The batch is a FIFO, so there is no way to skip the head item without consuming it, and `populate_pipe()` offers types in linker order. A build that registers both a handled type and an unhandled one will therefore stop uploading the handled one as soon as the unhandled one has records to offer. The survey build accepts that — it registers `BATTERY`, `ENVIRONMENTAL` and `SURVEY`, and uploading the first two is not what the device is for, whereas deleting a survey capture is unrecoverable. A build that genuinely needs both should skip handler-less types in `populate_pipe()` instead of offering them and aborting in `cloud.c`.
+
 #### Target-specific defaults
 
 Block size comes from the mounted filesystem (`fs_statvfs()`), which on ATT targets uses external SPI-NOR with `CONFIG_SPI_NOR_FLASH_LAYOUT_PAGE_SIZE=4096` (0x1000). The table below illustrates minimal sizing for a **small** configuration (three data types, eight records per type); the shipped default is **1 MiB** with up to **256** records per type, which needs far more blocks—the LittleFS backend checks sizing at init (see the `LittleFS partition size verified` log line) or use the formula above.
