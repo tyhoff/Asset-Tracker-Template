@@ -113,41 +113,72 @@ serving-cell = cell
 gci-cell = cell
 
 gnss-fix = {
-    1 => int .size 4,         ; lat, degrees * 1e7
-    2 => int .size 4,         ; lon, degrees * 1e7
-    3 => uint .size 4,        ; acc, horizontal accuracy in millimetres
-    ? 4 => int .size 4,       ; alt, millimetres above ellipsoid
-    ? 5 => uint .size 4,      ; spd, millimetres per second
-    ? 6 => uint .size 2,      ; hdg, degrees * 100
-    ? 7 => uint .size 1,      ; satellites used in the fix
+    1 => lat-e7,              ; degrees * 1e7
+    2 => lon-e7,              ; degrees * 1e7
+    3 => acc-mm,              ; horizontal accuracy, millimetres
+    ? 4 => alt-mm,            ; millimetres above ellipsoid
+    ? 5 => spd-mmps,          ; millimetres per second
+    ? 6 => hdg-cdeg,          ; degrees * 100
+    ? 7 => sats-used,
 }
+
+lat-e7 = int .size 4
+lon-e7 = int .size 4
+acc-mm = uint .size 4
+alt-mm = int .size 4
+spd-mmps = uint .size 4
+hdg-cdeg = uint .size 2
+sats-used = uint .size 1
 
 ; An identified cell: serving, or an entry of the GCI list. pci is deliberately absent --
 ; mcc/mnc/eci/tac identify the cell globally, so the physical cell ID adds nothing a lookup
 ; can use. Neighbours, which have no identity, do carry it.
 cell = {
-    1 => uint .size 4,        ; eci
-    2 => uint .size 2,        ; mcc
-    3 => uint .size 2,        ; mnc
-    4 => uint .size 4,        ; tac
-    ? 5 => uint .size 4,      ; earfcn
-    ? 6 => uint .size 1,      ; rsrp, 3GPP index
-    ? 7 => uint .size 1,      ; rsrq, 3GPP index
-    ? 8 => uint .size 2,      ; adv, timing advance. Usually absent -- see FW-3.
+    1 => eci,
+    2 => mcc,
+    3 => mnc,
+    4 => tac,
+    ? 5 => earfcn,
+    ? 6 => rsrp-idx,          ; 3GPP index
+    ? 7 => rsrq-idx,          ; 3GPP index
+    ? 8 => adv,               ; timing advance. Usually absent -- see FW-3.
 }
+
+eci = uint .size 4
+mcc = uint .size 2
+mnc = uint .size 2
+tac = uint .size 4
+earfcn = uint .size 4
+rsrp-idx = uint .size 1
+rsrq-idx = uint .size 1
+adv = uint .size 2
 
 ; A neighbour measurement. pci is what distinguishes one from another, so it is required.
+; The scalar types repeat cell's definitions under different names because zcbor derives
+; generated function names from the type, and a type used at two different map keys
+; collides.
 neighbour = {
-    1 => uint .size 2,        ; pci
-    ? 2 => uint .size 4,      ; earfcn
-    ? 3 => uint .size 1,      ; rsrp, 3GPP index
-    ? 4 => uint .size 1,      ; rsrq, 3GPP index
-    ? 5 => int .size 4,       ; timeDiff
+    1 => pci,
+    ? 2 => nbr-earfcn,
+    ? 3 => nbr-rsrp-idx,
+    ? 4 => nbr-rsrq-idx,
+    ? 5 => time-diff,
 }
 
+pci = uint .size 2
+nbr-earfcn = uint .size 4
+nbr-rsrp-idx = uint .size 1
+nbr-rsrq-idx = uint .size 1
+time-diff = int .size 4
+
 access-point = {
-    1 => bstr .size 6,        ; macAddress
-    2 => int .size 1,         ; signalStrength, dBm
-    ? 3 => uint .size 1,      ; channel. Omitted when the driver reported 0.
-    ? 4 => uint .size 1,      ; band, enum wifi_frequency_bands. Only with channel.
+    1 => mac,                 ; macAddress
+    2 => rssi-dbm,            ; signalStrength
+    ? 3 => ap-channel,        ; omitted when the driver reported 0
+    ? 4 => ap-band,           ; enum wifi_frequency_bands. Only present with channel.
 }
+
+mac = bstr .size 6
+rssi-dbm = int .size 1
+ap-channel = uint .size 1
+ap-band = uint .size 1

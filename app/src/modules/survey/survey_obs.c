@@ -10,6 +10,7 @@
 #include <zephyr/net/wifi.h>
 #include <modem/lte_lc.h>
 
+#include "survey_absent.h"
 #include "survey_obs.h"
 
 /* The modem reports RSRP and RSRQ as 3GPP index values, not as dBm/dB -- lte_lc passes
@@ -74,53 +75,6 @@ static const char *wifi_band_str(uint8_t band)
 	default:
 		return "unknown";
 	}
-}
-
-/* Absence predicates.
- *
- * The struct these read from is zero-initialised before every scan and is only partly
- * filled in: a Wi-Fi-only result leaves the whole cell block at zero. Rendering those
- * zeroes as measurements would fabricate a serving cell at -141 dBm out of nothing, so
- * every field that cannot legitimately be zero is reported as "absent" instead.
- */
-static bool eci_absent(uint32_t eci)
-{
-	return eci == LTE_LC_CELL_EUTRAN_ID_INVALID || eci == 0;
-}
-
-static bool earfcn_absent(uint32_t earfcn)
-{
-	/* EARFCN 0 is valid in 3GPP numbering but is what an uninitialised struct holds,
-	 * and no deployed E-UTRA band uses it, so treat it as unavailable.
-	 */
-	return earfcn == 0 || earfcn > LTE_LC_CELL_EARFCN_MAX;
-}
-
-static bool rsrp_absent(int16_t rsrp)
-{
-	/* lte_lc.h documents index 0 as "not used", so it is never a measurement. */
-	return rsrp == LTE_LC_CELL_RSRP_INVALID || rsrp == 0;
-}
-
-static bool rsrq_absent(int16_t rsrq)
-{
-	/* As for RSRP, index 0 is documented as "not used". */
-	return rsrq == LTE_LC_CELL_RSRQ_INVALID || rsrq == 0;
-}
-
-static bool adv_absent(uint16_t adv)
-{
-	/* Timing advance is only measured in RRC-connected state; in idle/PSM the modem
-	 * reports LTE_LC_CELL_TIMING_ADVANCE_INVALID. 0 is likewise treated as
-	 * unavailable: it is the uninitialised value and this application does not hold
-	 * the modem connected to obtain a real one.
-	 *
-	 * A timing advance of 0 is nominally valid, for a device right at the tower, so
-	 * this discards a real reading in that one case. That is deliberate: adv is not a
-	 * goal of this application, and reporting an uninitialised 0 as a measurement
-	 * would be the worse error.
-	 */
-	return adv == LTE_LC_CELL_TIMING_ADVANCE_INVALID || adv == 0;
 }
 
 static const char *time_base_str(enum survey_time_base base)
@@ -211,14 +165,14 @@ void survey_obs_snapshot(struct survey_observation *out)
 static void format_signal(survey_print_fn print, void *ctx, const char *indent, int16_t rsrp,
 			  int16_t rsrq)
 {
-	if (rsrp_absent(rsrp)) {
+	if (survey_rsrp_absent(rsrp)) {
 		print(ctx, "%srsrp absent", indent);
 	} else {
 		print(ctx, "%srsrp %d (idx) = %d dBm", indent, rsrp,
 		      SURVEY_RSRP_IDX_TO_DBM((int)rsrp));
 	}
 
-	if (rsrq_absent(rsrq)) {
+	if (survey_rsrq_absent(rsrq)) {
 		print(ctx, "%srsrq absent", indent);
 	} else {
 		print(ctx, "%srsrq %d (idx) = %.1f dB", indent, rsrq,
@@ -231,8 +185,8 @@ static void format_signal(survey_print_fn print, void *ctx, const char *indent, 
  */
 static bool cell_empty(const struct location_cell_info *cell)
 {
-	return eci_absent(cell->id) && earfcn_absent(cell->earfcn) &&
-	       rsrp_absent(cell->rsrp) && rsrq_absent(cell->rsrq);
+	return survey_eci_absent(cell->id) && survey_earfcn_absent(cell->earfcn) &&
+	       survey_rsrp_absent(cell->rsrp) && survey_rsrq_absent(cell->rsrq);
 }
 
 static void format_identified_cell(survey_print_fn print, void *ctx, const char *indent,
@@ -243,7 +197,7 @@ static void format_identified_cell(survey_print_fn print, void *ctx, const char 
 		return;
 	}
 
-	if (eci_absent(cell->id)) {
+	if (survey_eci_absent(cell->id)) {
 		/* Without a cell identity, mcc/mnc/tac are not meaningful either. */
 		print(ctx, "%seci absent (cell not identified)", indent);
 	} else {
@@ -251,7 +205,7 @@ static void format_identified_cell(survey_print_fn print, void *ctx, const char 
 		print(ctx, "%smcc %d mnc %d tac %u", indent, cell->mcc, cell->mnc, cell->tac);
 	}
 
-	if (earfcn_absent(cell->earfcn)) {
+	if (survey_earfcn_absent(cell->earfcn)) {
 		print(ctx, "%searfcn absent", indent);
 	} else {
 		print(ctx, "%searfcn %u", indent, cell->earfcn);
@@ -259,7 +213,7 @@ static void format_identified_cell(survey_print_fn print, void *ctx, const char 
 
 	format_signal(print, ctx, indent, cell->rsrp, cell->rsrq);
 
-	if (adv_absent(cell->timing_advance)) {
+	if (survey_adv_absent(cell->timing_advance)) {
 		print(ctx, "%sadv absent", indent);
 	} else {
 		print(ctx, "%sadv %u", indent, cell->timing_advance);
@@ -331,7 +285,7 @@ static void format_scan(const struct survey_observation *o, survey_print_fn prin
 		const struct location_neighbor_cell_info *n = &o->scan.neighbor_cells[i];
 
 		print(ctx, "    [%u] pci %u", i, n->phys_cell_id);
-		if (earfcn_absent(n->earfcn)) {
+		if (survey_earfcn_absent(n->earfcn)) {
 			print(ctx, "        earfcn absent");
 		} else {
 			print(ctx, "        earfcn %u", n->earfcn);
