@@ -1,0 +1,153 @@
+; Radio survey record and session header.
+; ---------------------------------------
+; One record per capture cycle: a GNSS fix bracketing pair plus the cell and Wi-Fi
+; observations seen between them. Decoded off-device by scripts/survey_decode.py, which
+; dispatches on the version field.
+;
+; Conventions, all of which the host decoder relies on:
+;
+; - Map keys are integers, not strings. A record is written thousands of times per drive
+;   and never read by a human in this form.
+; - Optional fields are OMITTED when not measured, never encoded as 0 or a sentinel. Zero
+;   is a plausible reading for several of these (rsrq, timeDiff, heading, altitude), so an
+;   encoded 0 must always mean "measured 0".
+; - MAC addresses are 6-byte binary strings, not text.
+; - Field names follow the nRF Cloud ground-fix API (https://api-docs.nrfcloud.com/) so the
+;   decoder's output is close to identity: lte[] carries mcc/mnc/eci/tac/earfcn/pci/rsrp/
+;   rsrq/adv with nmr[] neighbours, wifi.accessPoints[] carries macAddress/signalStrength/
+;   channel/frequency.
+; - rsrp and rsrq are stored as the 3GPP INDEX values the modem reports, not dBm. The
+;   decoder converts. Storing the index keeps them small and lossless.
+; - frequency is NOT stored for Wi-Fi. It is a pure function of (band, channel), so the
+;   decoder derives it with the same mapping the firmware uses for display.
+;
+; Timestamps: one absolute epoch-millisecond base per record, then small signed deltas from
+; that base for the other five. At a 10 s cadence every delta fits in two bytes, where five
+; more absolute epoch-ms values would cost six bytes each.
+;
+; VERSION HISTORY
+;   1  Initial schema.
+
+; --- Session header ---------------------------------------------------------------------
+;
+; Written once at the start of an export, before any records, so a dataset is attributable
+; and reproducible. Carries its own version: the header format and the record format can
+; move independently.
+
+survey-session = {
+    1 => version,             ; must match the record version
+    2 => device-id,
+    3 => app-version,
+    4 => modem-version,       ; e.g. "mfw_nrf91x1_2.0.4"
+    ? 5 => exported-at,       ; epoch ms; omitted if the clock was never set
+}
+
+device-id = tstr
+app-version = tstr
+modem-version = tstr
+exported-at = uint .size 8
+
+; --- Record -----------------------------------------------------------------------------
+
+; Scalars are given names rather than written inline: zcbor derives C member names from the
+; type, so an inline "1 => uint" becomes a member called uint1uint.
+version = uint .size 2
+sequence = uint .size 4
+t-base = uint .size 8
+cell-start-ms = int .size 4
+cell-end-ms = int .size 4
+wifi-start-ms = int .size 4
+wifi-end-ms = int .size 4
+gnss-after-ms = int .size 4
+
+survey-record = {
+    1 => version,
+    2 => sequence,            ; monotonic within a session
+    3 => profile,
+    4 => time-base,
+    5 => t-base,              ; absolute epoch ms, or uptime ms if time-base is 1
+
+    ; Bracketing GNSS fixes. Both are optional because a cycle whose fix failed is still
+    ; worth keeping -- the radio observations remain valid, they just cannot be scored.
+    ; The decoder interpolates ground truth to the scan midpoint and refuses to when a
+    ; bracket is missing.
+    ? 6 => gnss-fix-before,
+    ? 7 => gnss-fix-after,
+
+    ; Deltas from t-base in milliseconds. Signed: t-base is the first GNSS fix, so a value
+    ; can legitimately precede it if the clock is stepped mid-cycle by a GNSS time update.
+    ? 8 => cell-start-ms,
+    ? 9 => cell-end-ms,
+    ? 10 => wifi-start-ms,
+    ? 11 => wifi-end-ms,
+    ? 12 => gnss-after-ms,
+
+    ? 13 => serving-cell,
+    ? 14 => [* neighbour],    ; nmr[]
+    ? 15 => [* gci-cell],     ; GCI full-identity cells
+    ? 16 => [* access-point], ; wifi.accessPoints[]
+    ? 17 => network-mode,
+}
+
+; 0 = FAST, 1 = DEEP.
+profile = uint .size 1
+
+; 0 = Unix epoch, correlatable with anything off-device.
+; 1 = milliseconds since boot, because the clock was never synchronised. The decoder must
+;     treat those records as unusable for accuracy scoring.
+time-base = uint .size 1
+
+; 0 = unknown, 1 = LTE-M, 2 = NB-IoT.
+network-mode = uint .size 1
+
+; --- Components -------------------------------------------------------------------------
+
+; Position, named as in the nRF Cloud GNSS device message.
+; lat/lon are scaled integers rather than floats: 1e-7 degrees is ~11 mm, far finer than
+; GNSS accuracy, and costs 4 bytes against 8 for a double.
+; zcbor derives generated function names from the type name, so a type used at two keys
+; collides. These aliases keep the schema single-sourced while giving each use its own name.
+gnss-fix-before = gnss-fix
+gnss-fix-after = gnss-fix
+serving-cell = cell
+gci-cell = cell
+
+gnss-fix = {
+    1 => int .size 4,         ; lat, degrees * 1e7
+    2 => int .size 4,         ; lon, degrees * 1e7
+    3 => uint .size 4,        ; acc, horizontal accuracy in millimetres
+    ? 4 => int .size 4,       ; alt, millimetres above ellipsoid
+    ? 5 => uint .size 4,      ; spd, millimetres per second
+    ? 6 => uint .size 2,      ; hdg, degrees * 100
+    ? 7 => uint .size 1,      ; satellites used in the fix
+}
+
+; An identified cell: serving, or an entry of the GCI list. pci is deliberately absent --
+; mcc/mnc/eci/tac identify the cell globally, so the physical cell ID adds nothing a lookup
+; can use. Neighbours, which have no identity, do carry it.
+cell = {
+    1 => uint .size 4,        ; eci
+    2 => uint .size 2,        ; mcc
+    3 => uint .size 2,        ; mnc
+    4 => uint .size 4,        ; tac
+    ? 5 => uint .size 4,      ; earfcn
+    ? 6 => uint .size 1,      ; rsrp, 3GPP index
+    ? 7 => uint .size 1,      ; rsrq, 3GPP index
+    ? 8 => uint .size 2,      ; adv, timing advance. Usually absent -- see FW-3.
+}
+
+; A neighbour measurement. pci is what distinguishes one from another, so it is required.
+neighbour = {
+    1 => uint .size 2,        ; pci
+    ? 2 => uint .size 4,      ; earfcn
+    ? 3 => uint .size 1,      ; rsrp, 3GPP index
+    ? 4 => uint .size 1,      ; rsrq, 3GPP index
+    ? 5 => int .size 4,       ; timeDiff
+}
+
+access-point = {
+    1 => bstr .size 6,        ; macAddress
+    2 => int .size 1,         ; signalStrength, dBm
+    ? 3 => uint .size 1,      ; channel. Omitted when the driver reported 0.
+    ? 4 => uint .size 1,      ; band, enum wifi_frequency_bands. Only with channel.
+}
