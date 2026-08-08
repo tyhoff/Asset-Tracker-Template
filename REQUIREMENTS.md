@@ -526,8 +526,22 @@ keeps the risk contained to one checkpoint instead of blocking the project.
    | Step | Measured | Notes |
    |---|---|---|
    | Wi-Fi scan, both bands | **4.66 / 4.66 / 4.87 s** | 10 APs each run, 3 of them 5 GHz |
+   | Scan leg (Wi-Fi **and** cell together) | **4.61 / 4.86 s** | 10 APs + serving + nmr + **3 GCI cells** |
+   | GNSS leg, hot | **0.55 / 2.13 s** | Immediately after a previous fix |
    | Warm GNSS fix | ~4.1 s | Single sample; 6 satellites, 6.6 m |
    | Cold GNSS fix | ~47.7 s | Single sample; no A-GNSS (`NRF_CLOUD_AGNSS=n`) |
+
+   **Full sequential cycle (GNSS then scan): 5.2 s and 7.0 s.** Comfortably inside a 10 s cadence
+   when GNSS is hot; a cold fix is what breaks the budget, not the radio work.
+
+   Note the scan leg covers Wi-Fi *and* the whole cell measurement, including a GCI search — the
+   Wi-Fi scan runs on the nRF7002 and overlaps the cell step, exactly as FW-2 anticipates.
+
+   **This contradicts FW-2's assumption that a GCI search costs 10–40 s.**
+   `CONFIG_LOCATION_REQUEST_DEFAULT_CELLULAR_CELL_COUNT` is already 3, and three full-identity cells
+   are being returned inside the same ~4.7 s. The FAST/DEEP split may therefore be unnecessary at
+   `cell_count = 3`, and the real question for CP7 is where the cost curve turns as the count rises.
+   Measure before building the gating machinery.
 
    Two conclusions. The Wi-Fi scan is **not** the cadence constraint — under 5 s against a 10–30 s
    target — and the board conf's 5000 ms Wi-Fi timeout had only ~3% margin over the measured time,
