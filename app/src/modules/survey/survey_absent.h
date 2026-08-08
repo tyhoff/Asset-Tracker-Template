@@ -55,6 +55,17 @@ static inline bool survey_rsrq_absent(int16_t rsrq)
 	return rsrq == LTE_LC_CELL_RSRQ_INVALID || rsrq == 0;
 }
 
+static inline bool survey_time_diff_absent(int time_diff)
+{
+	/* Reads as a legitimate "perfectly aligned with the serving cell", but lte_lc.h
+	 * defines LTE_LC_CELL_TIME_DIFF_INVALID as 0 -- so a neighbour the modem could not
+	 * time-align is indistinguishable from one that aligned exactly. Storing it would
+	 * fabricate the strongest possible alignment out of a failed measurement, which is
+	 * the worse error for anything doing TDOA-style analysis downstream.
+	 */
+	return time_diff == LTE_LC_CELL_TIME_DIFF_INVALID;
+}
+
 static inline bool survey_adv_absent(uint16_t adv)
 {
 	/* Timing advance is only measured in RRC-connected state; in idle/PSM the modem

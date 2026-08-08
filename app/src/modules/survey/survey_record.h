@@ -39,10 +39,20 @@ extern "C" {
  */
 #define SURVEY_RECORD_VERSION 1
 
-/** Upper bound on one encoded record, for buffer sizing.
+/** FW-5's design budget for one record, in bytes.
  *
- * Not a guess: see the measured figure recorded by the encoder's unit test. The margin
- * exists so that raising a neighbour or AP cap does not silently start truncating.
+ * This is the number storage capacity is planned from, and the encoder's unit test
+ * asserts a fully populated DEEP record against it -- 10 APs, 10 neighbours, 3 GCI cells
+ * and both bracketing fixes measured at 583 B. A schema change that pushes past this is a
+ * capacity decision about how many days of data fit on the device, so it should fail a
+ * build rather than turn up during a drive.
+ */
+#define SURVEY_RECORD_BUDGET_SIZE 700
+
+/** Buffer size for one encoded record.
+ *
+ * Headroom over the budget, so that a record which overshoots is reported as an
+ * out-of-budget failure by the test rather than as a truncated encode at runtime.
  */
 #define SURVEY_RECORD_MAX_SIZE 1024
 
@@ -113,6 +123,25 @@ struct survey_record_session {
 	bool exported_at_valid;
 	int64_t exported_at_ms;
 };
+
+/** @brief Build a record from a cached observation.
+ *
+ * Exists so the encoder can be exercised on target before the capture orchestrator
+ * lands. The cache holds the latest fix and the latest scan independently rather than as
+ * a matched pair, so the result carries only a leading fix: there is no second bracketing
+ * fix, and no measurement offsets, because the cache records when the application
+ * observed a scan and not when the modem measured it.
+ *
+ * Everything the cache cannot supply is left absent rather than filled with a plausible
+ * value, so a record built this way is honestly distinguishable from one the orchestrator
+ * produced.
+ *
+ * @param obs       Snapshot from @c survey_obs_snapshot.
+ * @param sequence  Sequence number to stamp into the record.
+ * @param out       Record to populate. Fully overwritten.
+ */
+void survey_record_from_obs(const struct survey_observation *obs, uint32_t sequence,
+			    struct survey_record_data *out);
 
 /** @brief Encode one capture cycle.
  *

@@ -291,7 +291,11 @@ static void format_scan(const struct survey_observation *o, survey_print_fn prin
 			print(ctx, "        earfcn %u", n->earfcn);
 		}
 		format_signal(print, ctx, "        ", n->rsrp, n->rsrq);
-		print(ctx, "        timeDiff %d", n->time_diff);
+		if (survey_time_diff_absent(n->time_diff)) {
+			print(ctx, "        timeDiff absent");
+		} else {
+			print(ctx, "        timeDiff %d", n->time_diff);
+		}
 	}
 
 	print(ctx, "  gci %u full-identity cell(s):", o->scan.gci_cells_count);

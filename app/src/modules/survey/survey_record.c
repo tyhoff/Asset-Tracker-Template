@@ -84,12 +84,16 @@ static void fill_cell(struct cell *dst, const struct location_cell_info *src)
 		dst->earfcn_m.earfcn_m = src->earfcn;
 		dst->earfcn_m_present = true;
 	}
+	/* Written through signed. The 3GPP indices are negative at the weak end of the
+	 * range and the schema types them accordingly; casting to unsigned here would make
+	 * zcbor reject the record outright.
+	 */
 	if (!survey_rsrp_absent(src->rsrp)) {
-		dst->rsrp_idx_m.rsrp_idx_m = (uint32_t)src->rsrp;
+		dst->rsrp_idx_m.rsrp_idx_m = src->rsrp;
 		dst->rsrp_idx_m_present = true;
 	}
 	if (!survey_rsrq_absent(src->rsrq)) {
-		dst->rsrq_idx_m.rsrq_idx_m = (uint32_t)src->rsrq;
+		dst->rsrq_idx_m.rsrq_idx_m = src->rsrq;
 		dst->rsrq_idx_m_present = true;
 	}
 	if (!survey_adv_absent(src->timing_advance)) {
@@ -112,19 +116,18 @@ static void fill_neighbour(struct neighbour *dst, const struct location_neighbor
 		dst->nbr_earfcn_m_present = true;
 	}
 	if (!survey_rsrp_absent(src->rsrp)) {
-		dst->nbr_rsrp_idx_m.nbr_rsrp_idx_m = (uint32_t)src->rsrp;
+		dst->nbr_rsrp_idx_m.nbr_rsrp_idx_m = src->rsrp;
 		dst->nbr_rsrp_idx_m_present = true;
 	}
 	if (!survey_rsrq_absent(src->rsrq)) {
-		dst->nbr_rsrq_idx_m.nbr_rsrq_idx_m = (uint32_t)src->rsrq;
+		dst->nbr_rsrq_idx_m.nbr_rsrq_idx_m = src->rsrq;
 		dst->nbr_rsrq_idx_m_present = true;
 	}
 
-	/* time_diff has no invalid marker and 0 is a real reading, so it is always
-	 * written when the neighbour itself was reported.
-	 */
-	dst->time_diff_m.time_diff_m = src->time_diff;
-	dst->time_diff_m_present = true;
+	if (!survey_time_diff_absent(src->time_diff)) {
+		dst->time_diff_m.time_diff_m = src->time_diff;
+		dst->time_diff_m_present = true;
+	}
 }
 
 static void fill_ap(struct access_point *dst, const struct location_wifi_ap_info *src)
@@ -171,6 +174,21 @@ static void fill_offset(struct survey_record *dst, const struct survey_record_da
 	}
 }
 
+/* The generated arrays are sized by zcbor's --default-max-qty, which is a build-time
+ * constant in the CMake rule and has no relationship to the app's Kconfig caps. Raising a
+ * cap past it does not overflow -- every loop below clamps -- it silently drops the extra
+ * APs or neighbours from every record ever written, which is the kind of loss that is only
+ * noticed months later in the dataset. Fail the build instead.
+ */
+BUILD_ASSERT(CONFIG_APP_LOCATION_WIFI_APS_MAX <=
+	     ARRAY_SIZE(((struct survey_record *)0)->access_point_m_l.access_point_m),
+	     "Wi-Fi AP cap exceeds the CBOR schema's max qty; raise it in the zcbor "
+	     "invocation in app/CMakeLists.txt");
+BUILD_ASSERT(CONFIG_APP_LOCATION_NEIGHBOR_CELLS_MAX <=
+	     ARRAY_SIZE(((struct survey_record *)0)->neighbour_m_l.neighbour_m),
+	     "Neighbour cell cap exceeds the CBOR schema's max qty; raise it in the zcbor "
+	     "invocation in app/CMakeLists.txt");
+
 static void fill_scan(struct survey_record *dst, const struct location_cloud_request_data *scan)
 {
 	size_t n;
@@ -211,11 +229,57 @@ static void fill_scan(struct survey_record *dst, const struct location_cloud_req
 	dst->access_point_m_l_present = (n > 0);
 }
 
+void survey_record_from_obs(const struct survey_observation *obs, uint32_t sequence,
+			    struct survey_record_data *out)
+{
+	if (obs == NULL || out == NULL) {
+		return;
+	}
+
+	memset(out, 0, sizeof(*out));
+
+	out->sequence = sequence;
+
+	/* The cache is filled by whatever trigger the operator ran, not by a profile
+	 * decision, so claiming DEEP here would misreport how the data was gathered.
+	 */
+	out->profile = SURVEY_PROFILE_FAST;
+
+	/* Prefer the fix's base: it is what t_base is taken from. Falling back to the
+	 * scan's base keeps a scan-only cycle correlatable.
+	 */
+	if (obs->gnss_valid) {
+		out->time_base = obs->gnss_time_base;
+		out->t_base_ms = obs->gnss_timestamp;
+		out->gnss_before_valid = true;
+		out->gnss_before = obs->gnss;
+	} else if (obs->scan_valid) {
+		out->time_base = obs->scan_time_base;
+		out->t_base_ms = obs->scan_timestamp;
+	}
+
+	if (obs->scan_valid) {
+		out->scan_valid = true;
+		out->scan = obs->scan;
+	}
+
+	/* gnss_after and every offset stay absent: the cache has no second fix, and its
+	 * scan timestamp is a receipt time rather than a measurement boundary. Writing it
+	 * as cell_start would assert a reading the modem never reported.
+	 */
+}
+
 int survey_record_encode(const struct survey_record_data *rec, uint8_t *buf, size_t buf_len,
 			 size_t *out_len)
 {
-	/* File scope would need a lock; this is only reached from the storage path, on a
-	 * thread whose stack is sized for it.
+	/* File scope because the generated struct is ~1.5 kB, far past any shell or
+	 * module thread stack.
+	 *
+	 * NOT thread-safe. Today there is exactly one caller at a time -- "survey hex" on
+	 * the shell thread -- so no lock is needed and none is paid for. The moment CP5's
+	 * storage path becomes a second caller this needs a mutex: two concurrent encodes
+	 * would interleave into this buffer and produce a plausible-looking hybrid record
+	 * with no diagnostic at all.
 	 */
 	static struct survey_record out;
 	int err;
@@ -254,7 +318,16 @@ int survey_record_encode(const struct survey_record_data *rec, uint8_t *buf, siz
 
 	err = cbor_encode_survey_record(buf, buf_len, &out, out_len);
 	if (err != ZCBOR_SUCCESS) {
-		return -ENOMEM;
+		/* Distinguish the two, because they call for opposite responses and
+		 * conflating them sends the reader down the wrong path entirely: a short
+		 * buffer is a sizing problem, while a range error means a real measurement
+		 * does not fit the schema's type and no buffer size will ever help.
+		 *
+		 * No logging here: this file is built into a native_sim unit test that does
+		 * not link the survey log module, and the errno reaches a caller that can
+		 * report it.
+		 */
+		return (err == ZCBOR_ERR_NO_PAYLOAD) ? -ENOMEM : -EINVAL;
 	}
 
 	return 0;

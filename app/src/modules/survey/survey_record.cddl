@@ -17,7 +17,8 @@
 ;   rsrq/adv with nmr[] neighbours, wifi.accessPoints[] carries macAddress/signalStrength/
 ;   channel/frequency.
 ; - rsrp and rsrq are stored as the 3GPP INDEX values the modem reports, not dBm. The
-;   decoder converts. Storing the index keeps them small and lossless.
+;   decoder converts. Storing the index keeps them small and lossless. The indices are
+;   SIGNED -- see the note on rsrp-idx.
 ; - frequency is NOT stored for Wi-Fi. It is a pure function of (band, channel), so the
 ;   decoder derives it with the same mapping the firmware uses for display.
 ;
@@ -92,9 +93,13 @@ survey-record = {
 ; 0 = FAST, 1 = DEEP.
 profile = uint .size 1
 
-; 0 = Unix epoch, correlatable with anything off-device.
-; 1 = milliseconds since boot, because the clock was never synchronised. The decoder must
-;     treat those records as unusable for accuracy scoring.
+; The wire values are enum survey_time_base, written through unchanged:
+;   0 = unset. No timestamp was ever recorded.
+;   1 = milliseconds since boot, because the clock was never synchronised. The decoder
+;       must treat those records as unusable for accuracy scoring.
+;   2 = Unix epoch, correlatable with anything off-device.
+; Ordering follows the C enum rather than putting Unix first: the enum is the source of
+; truth because the encoder casts it straight onto the wire.
 time-base = uint .size 1
 
 ; 0 = unknown, 1 = LTE-M, 2 = NB-IoT.
@@ -149,8 +154,13 @@ mcc = uint .size 2
 mnc = uint .size 2
 tac = uint .size 4
 earfcn = uint .size 4
-rsrp-idx = uint .size 1
-rsrq-idx = uint .size 1
+; SIGNED, not unsigned. lte_lc.h documents the 3GPP index ranges as RSRP -17..97 and
+; RSRQ -30..46 -- the negative half is where a cell-edge measurement lives, which is
+; exactly the population this survey exists to characterise. A uint here does not merely
+; clip the value: zcbor range-guards it, so one negative neighbour reading fails
+; cbor_encode_survey_record and discards the WHOLE record, GNSS bracket and all.
+rsrp-idx = int .size 1
+rsrq-idx = int .size 1
 adv = uint .size 2
 
 ; A neighbour measurement. pci is what distinguishes one from another, so it is required.
@@ -167,8 +177,8 @@ neighbour = {
 
 pci = uint .size 2
 nbr-earfcn = uint .size 4
-nbr-rsrp-idx = uint .size 1
-nbr-rsrq-idx = uint .size 1
+nbr-rsrp-idx = int .size 1
+nbr-rsrq-idx = int .size 1
 time-diff = int .size 4
 
 access-point = {

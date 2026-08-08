@@ -15,13 +15,16 @@
 #include <zephyr/shell/shell.h>
 #include <zephyr/zbus/zbus.h>
 #include <zephyr/net/wifi.h>
+#include <zephyr/sys/util.h>
 #include <modem/lte_lc.h>
+#include <errno.h>
 #include <stdarg.h>
 
 #include "app_common.h"
 #include "location.h"
 #include "survey.h"
 #include "survey_obs.h"
+#include "survey_record.h"
 
 /* Guards against a future Kconfig edit that separates the two symbols: without the scan
  * trigger handler compiled into the location module, "survey scan" would publish a
@@ -41,6 +44,16 @@ static union {
 	struct survey_observation obs;
 	struct location_msg msg;
 } scratch;
+
+/* Not part of the union above: building a record reads the snapshot while writing the
+ * record, so the two cannot share storage. Both are around a kilobyte, which is why
+ * neither lives on the shell thread's stack.
+ */
+static struct survey_record_data hex_record;
+static uint8_t hex_buf[SURVEY_RECORD_MAX_SIZE];
+
+/* One line stays inside the shell's own output buffer and remains greppable by eye. */
+#define HEX_BYTES_PER_LINE 32
 
 /* Adapter from the formatter's line sink to the shell. */
 static void shell_line_print(void *ctx, const char *fmt, ...)
@@ -161,6 +174,26 @@ static int cmd_survey_selftest(const struct shell *sh, size_t argc, char **argv)
 				.year = 2026, .month = 1, .day = 1,
 				.hour = 0, .minute = 0, .second = 0, .ms = 0,
 			},
+#if defined(CONFIG_LOCATION_DATA_DETAILS)
+			/* Non-zero on purpose. The encoder writes altitude, speed,
+			 * heading and satsUsed whenever a fix carries details, and each
+			 * of those has a legitimate zero -- so leaving this block at its
+			 * default would make "survey selftest" followed by "survey hex"
+			 * emit four fabricated zeroes as measurements, which is exactly
+			 * the confusion the schema's absent-not-zero rule exists to
+			 * prevent.
+			 */
+			.details = {
+				.gnss = {
+					.satellites_used = 7,
+					.pvt_data = {
+						.altitude = 42.5f,
+						.speed = 1.25f,
+						.heading = 137.0f,
+					},
+				},
+			},
+#endif /* CONFIG_LOCATION_DATA_DETAILS */
 		},
 	};
 	survey_obs_update(&scratch.msg, 1767225600000, SURVEY_TIME_BASE_UNIX);
@@ -200,6 +233,70 @@ static int cmd_survey_selftest(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+/* Encodes the cached observation and prints the CBOR as hex.
+ *
+ * This is CP3's on-target proof: it exercises the real encoder against real modem data
+ * and needs no host tooling to show that encoding happened and how large the result is.
+ * The delimiters exist so the host decoder can lift the payload straight out of a
+ * terminal capture without the operator editing anything by hand.
+ *
+ * The record is built from the observation cache, which holds the latest fix and the
+ * latest scan independently. Until the capture orchestrator lands, that means no second
+ * bracketing fix and no measurement offsets -- see survey_record_from_obs.
+ */
+static int cmd_survey_hex(const struct shell *sh, size_t argc, char **argv)
+{
+	size_t len;
+	int err;
+
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	survey_obs_snapshot(&scratch.obs);
+
+	if (!scratch.obs.gnss_valid && !scratch.obs.scan_valid) {
+		shell_warn(sh, "Nothing cached. Run \"survey scan\", \"survey gnss\" or "
+			       "\"survey selftest\" first.");
+		return -ENODATA;
+	}
+
+	/* Loud, because these bytes are indistinguishable from a real record once they are
+	 * pasted into the host decoder.
+	 */
+	if (scratch.obs.synthetic) {
+		shell_warn(sh, "Cache holds synthetic data: this record is NOT a measurement.");
+	}
+
+	survey_record_from_obs(&scratch.obs, 0, &hex_record);
+
+	err = survey_record_encode(&hex_record, hex_buf, sizeof(hex_buf), &len);
+	if (err == -ENOMEM) {
+		shell_error(sh, "Encode failed: record did not fit in %u bytes.",
+			    (unsigned int)sizeof(hex_buf));
+		return err;
+	} else if (err) {
+		shell_error(sh, "Encode failed (%d): a value is outside its schema type. "
+				"Enlarging the buffer will not help.", err);
+		return err;
+	}
+
+	shell_print(sh, "survey record: %u bytes, schema version %d", (unsigned int)len,
+		    SURVEY_RECORD_VERSION);
+	shell_print(sh, "-----BEGIN SURVEY RECORD-----");
+
+	for (size_t i = 0; i < len; i += HEX_BYTES_PER_LINE) {
+		char line[HEX_BYTES_PER_LINE * 2 + 1];
+		size_t n = MIN(HEX_BYTES_PER_LINE, len - i);
+
+		bin2hex(&hex_buf[i], n, line, sizeof(line));
+		shell_print(sh, "%s", line);
+	}
+
+	shell_print(sh, "-----END SURVEY RECORD-----");
+
+	return 0;
+}
+
 /* SHELL_CMD_ARG with zero optional arguments, so that a mistyped "survey show 3" reports
  * an error instead of silently ignoring the argument.
  */
@@ -216,6 +313,8 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_survey,
 		      "Discard the cached observation", cmd_survey_clear, 1, 0),
 	SHELL_CMD_ARG(selftest, NULL,
 		      "Render a synthetic observation; needs no radio", cmd_survey_selftest, 1, 0),
+	SHELL_CMD_ARG(hex, NULL,
+		      "Encode the cached observation and hexdump the CBOR", cmd_survey_hex, 1, 0),
 	SHELL_SUBCMD_SET_END
 );
 
