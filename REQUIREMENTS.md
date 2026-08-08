@@ -519,6 +519,34 @@ keeps the risk contained to one checkpoint instead of blocking the project.
 2. **Timing characterisation.** Real durations for hot GNSS, light cell measurement, GCI search,
    Wi-Fi scan — via `survey timing`. These set the actual interpolation error budget; measure rather
    than trusting the estimates in FW-4.
+
+   Partial data already measured on target (one bench position, host-clock round trip from issuing
+   the trigger to the result being stamped, so each figure includes a little console latency):
+
+   | Step | Measured | Notes |
+   |---|---|---|
+   | Wi-Fi scan, both bands | **4.66 / 4.66 / 4.87 s** | 10 APs each run, 3 of them 5 GHz |
+   | Warm GNSS fix | ~4.1 s | Single sample; 6 satellites, 6.6 m |
+   | Cold GNSS fix | ~47.7 s | Single sample; no A-GNSS (`NRF_CLOUD_AGNSS=n`) |
+
+   Two conclusions. The Wi-Fi scan is **not** the cadence constraint — under 5 s against a 10–30 s
+   target — and the board conf's 5000 ms Wi-Fi timeout had only ~3% margin over the measured time,
+   which is why it was raised.
+
+   Dwell-time tuning was tried and **rejected on measurement**: with
+   `LOCATION_METHOD_WIFI_SCANNING_PARAMS_OVERRIDE` and passive dwell cut 260→130 ms, active 50→40 ms,
+   four runs gave 4.27 / 5.04 / 4.42 / 4.44 s — a ~4% mean change, inside the run-to-run spread, with
+   one tuned run slower than every baseline run. Scan time is therefore not dwell-dominated, so the
+   default 260 ms (two beacon intervals, better for weak APs) is kept.
+
+   What would genuinely shorten it all costs data: `WIFI_NRF70_SCAN_DISABLE_DFS_CHANNELS` would drop
+   channel 116, which carried 3 of the 10 APs seen here, and restricting the channel list is the same
+   pre-filtering FW-5 forbids. `max_bss_cnt` is not an option — Zephyr documents that it cannot be
+   relied on to limit scan time.
+
+   The cycle-time work therefore belongs in FW-2's sequencing, not in the scan: the Wi-Fi scan runs
+   on the nRF7002 and may overlap the cell measurement, and the remaining dominators are the GCI
+   search (10–40 s) and a cold GNSS fix.
 3. **Storage soak.** Run to partition-full; confirm full-behaviour, no corruption, and that export
    after power-cycle returns every record.
 4. **Drive test.** Short loop with overlapping passes; confirm repeat visits produce consistent
