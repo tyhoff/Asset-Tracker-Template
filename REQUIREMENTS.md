@@ -476,7 +476,8 @@ A `survey` shell command group is checkpoint CP1 — ahead of all data-format an
 | `survey stats` | observation counters and cache age | CP1 ✅ |
 | `survey clear` | discard the cached observation | CP1 ✅ |
 | `survey selftest` | render a synthetic observation; needs no radio | CP1 ✅ |
-| `survey hex [n]` | hexdump the encoded CBOR record — proves the encoder without a host | CP3 |
+| `survey hex` | hexdump the encoded CBOR of the **cached** observation — proves the encoder without a host | CP3 ✅ |
+| `survey hex <n>` | hexdump a **stored** record by index; needs somewhere to store one | CP5 |
 | `survey timing` | last measured durations for GNSS / cell / Wi-Fi steps | CP7 |
 | `survey profile <fast\|deep>` | force a profile, bypassing the gating logic | CP7 |
 
@@ -497,14 +498,41 @@ hardware**. `native_sim` proofs are the gate for merging; on-target proofs are r
 | **CP0** ✅ | Environment + baseline + `scripts/run_unit_tests.sh`. No functional change. | **Done.** Baseline builds for `thingy91x/nrf9151/ns` (`merged.hex` produced); `scripts/run_unit_tests.sh` = **11/11 passed, 0 filtered**. Baseline size: **text 400,640 / data 155,473 / bss 190,982**. | Flash unmodified app, confirm it boots |
 | **CP1** ✅ | `survey` shell group + `CONFIG_APP_SURVEY` (default n); `show` prints observations from the **existing** pipeline (no new fields yet). Adds `LOCATION_SCAN_SEARCH_TRIGGER` + `CONFIG_APP_LOCATION_SCAN_TRIGGER` to the location module. | **Done.** `tests/module/survey` = **29/29**; `tests/module/location` extended with 4 tests for the new trigger. Survey-off build **byte-identical to CP0** (text 400,640 / data 155,473 / bss 190,982); survey-on +2,276 text / +2,376 bss, RAM 83.3%. Both produce `merged.hex`. | `survey selftest` first (no radio needed), then `survey scan` → `survey show` prints real cells + APs; `survey gnss` → `survey show` prints a fix |
 | **CP2** ✅ | FW-1 struct fields: `channel` + `band` on Wi-Fi, plumbed through `location_helper.c` and `cloud_location.c`; `frequency` derived for display. No cell-struct change — PCI deliberately omitted on identified cells. | **Done.** `tests/module/survey` = **33/33** (frequency derivation across 2.4/5 GHz, absent channel, unrecognised band, channel-outside-band); `tests/module/location` Wi-Fi verifier asserts `channel`/`band` survive onto the zbus message. Survey build FLASH 65.63% / RAM 79.11%; default build also verified so the `cloud_location.c` path is compiled. Storage pipe raised 512→576 (`struct location_msg` grew 492→512, +4 header = 516 required). | **Done.** `survey selftest` renders `channel 6 frequency 2437 MHz band 2.4GHz`; real scan returned 9 APs with channels 1/4/6/11 → 2412/2427/2437/2462 MHz, channels cross-checked against an independent host Wi-Fi scan |
-| **CP3** | FW-5 CBOR encoder + CDDL + `version` field | Unit test: encode → decode round-trip; assert absent fields are **absent, not zero**; assert size ≤ 700 B with 10 APs + 10 neighbors and **record the measured size** | `survey hex` + `survey selftest` prints PASS |
-| **CP4** | HOST-1 decoder (reads CP3 output) | Golden-file test: fixture CBOR → expected JSON. Feed it the exact bytes from CP3's unit test so encoder and decoder are proven against each other | Decode a real `survey hex` dump from the device |
+| **CP3** ✅ | FW-5 CBOR encoder + CDDL + `version` field; `survey hex` encodes the cached observation | **Done.** `tests/module/survey_record` = **23/23**, full `tests/module` = **13/13 configurations**. Absent-not-zero asserted per optional field. **Measured worst case: 583 B** (10 APs + 10 neighbours + 3 GCI + both bracket fixes + all six timestamps), asserted against the 700 B budget rather than printed. Survey build text 384,980 / data 148,794 / bss 186,971; default build also verified. | `survey hex` prints a decodable dump |
+| **CP4** ✅ | HOST-1 decoder `scripts/survey_decode.py` (reads CP3 output) | **Done.** `tests/host` = **58/58**, stdlib only. Golden files are the **exact bytes CP3's encoder emitted**, lifted from the suite by `scripts/survey_fixture.py`, so encoder and decoder are proven against each other rather than against two readings of the CDDL — which is how the `time-base` enum disagreement below was caught. Covers indefinite-length CBOR (what zcbor actually emits), version dispatch, RSRP/RSRQ and Wi-Fi frequency conversion, interpolation, and the quality gate. | Decode a real `survey hex` dump from the device |
 | **CP5** | FW-6 storage: new record type, LittleFS backend, grown partition | Unit test: store N records, read back, assert count and content. Assert configured full-behaviour at capacity | `survey stats`; store records, power-cycle, confirm count survives |
 | **CP6** | FW-2/FW-4 paired capture orchestrator: GNSS bracket + scan, all six timestamps | Unit test with faked Location library: assert request **sequence** (GNSS → scan → GNSS), assert no overlap, assert all timestamps populated and ordered | `survey scan` then `survey show` shows two GNSS fixes bracketing the scan; `survey timing` reports real durations |
 | **CP7** | FW-2 profiles FAST/DEEP + gating | Unit test: gating decisions across a speed/power truth table; assert DEEP requests GCI | `survey profile deep` yields multiple full-identity GCI cells; FAST does not |
 | **CP8** | FW-8 export protocol over USB CDC | Unit test: framing, length prefix, checksum, resume-from-sequence | Export to host, verify checksums, interrupt mid-transfer and confirm resume is lossless and non-destructive |
 | **CP9** | HOST-2 Web Serial page | Manual: point it at a recorded dump/fixture stream | Full export from device via browser |
 | **CP10** | FW-7 cadence, FW-9 LEDs, FW-10 hygiene | Unit test: timer reschedule maths; assert ground-fix is never called | Headless cold-boot run; LED states legible; storage-full behaviour correct |
+
+**Note on CP4 — why the golden files are generated, not hand-written.** The first decoder was written
+from the CDDL and disagreed with the firmware on `time-base`: the schema documented `0 = Unix epoch,
+1 = uptime`, while the encoder casts `enum survey_time_base` (`NONE=0, UPTIME=1, UNIX=2`) straight
+onto the wire. Every record would have been mislabelled, and no test written against the CDDL alone
+would have caught it. The CDDL now documents the C enum, which is the source of truth because the
+encoder writes it through unchanged. Keep the fixtures generated from real encoder output
+(`tests/host/README.md`) — that property is the whole value of the test.
+
+**Note on schema types — three defects the pre-commit review caught, all of the same shape.** Each
+was a type or sentinel that looked right against a synthetic record and was wrong against a real one:
+
+- **RSRP and RSRQ were typed `uint`.** `lte_lc.h` documents the 3GPP indices as RSRP −17…97 and
+  RSRQ −30…46, and zcbor **range-guards** rather than clipping — so one negative neighbour reading
+  fails `cbor_encode_survey_record` and discards the **entire** record, GNSS bracket included. It
+  would only ever have fired at the edge of coverage, which is the population this survey exists to
+  measure. Now `int .size 1`, with a round-trip test at both range bottoms.
+- **`timeDiff` of 0 was stored as a measurement.** `LTE_LC_CELL_TIME_DIFF_INVALID` **is** 0, so that
+  fabricated perfect alignment out of a neighbour the modem could not align. Now absent, via
+  `survey_absent.h` so the console and the encoder cannot disagree.
+- **`survey selftest` fabricated four GNSS detail fields as zero.** The synthetic `location_msg` left
+  `details` zeroed while the encoder writes altitude/speed/heading/satsUsed whenever a fix carries
+  details — the first command the operator is told to run emitted four fake measurements. The
+  synthetic fixture now carries non-zero details.
+
+The pattern to carry into CP5: a field's *sentinel* is part of its type, and a synthetic test record
+that only uses comfortable values proves nothing about either.
 
 **Note on CP8:** USB on Thingy:91 X routes through the nRF5340 connectivity bridge, not the
 nRF9151. That cannot be fully validated on the host. Prove the *protocol* over the existing serial

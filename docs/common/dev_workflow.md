@@ -268,6 +268,50 @@ generates the Unity runner by scanning for `void test_*(void)` functions, so a n
 manual registration — but it is silently absent if misnamed, which is why the per-test output above
 is worth checking after adding tests.
 
+### A suite that boots and then hangs is missing `main()`
+
+Failure signature: the suite builds, twister prints the Zephyr boot banner, then nothing, and the run
+eventually fails with `FAILED: Unknown Error` and no test output at all.
+
+`test_runner_generate()` emits `unity_main()`, **not** `main()`. If the suite does not define one,
+Zephyr's weak `main` runs, returns immediately, and the main thread exits — leaving native_sim to
+tick its timer against real time forever. Every suite needs:
+
+```c
+/* Provided by the test runner generator. */
+extern int unity_main(void);
+
+int main(void)
+{
+	(void)unity_main();
+
+	return 0;
+}
+```
+
+This looks exactly like a CMake or Kconfig problem and is not one. Before suspecting the build, run
+`nm` on the ELF or diff the suite against a passing one — `tests/module/survey` is the reference. To
+confirm directly, `apt-get install -y gdb` inside the container and attach to the `zephyr.exe`
+twister left running: a backtrace showing only the idle thread in `hwtimer_tick_timer_reached` →
+`nanosleep` means the main thread is gone, not blocked.
+
+### Keeping twister artifacts
+
+`scripts/run_unit_tests.sh` runs the container with `--rm`, so `handler.log` and the ELFs vanish with
+it. When you need them afterwards — extracting host fixtures, running gdb, inspecting symbols — run
+the container directly with an output mount as shown above.
+
+## Host tests
+
+The Python under `scripts/` has its own suite, which does not involve Docker, Zephyr, or a toolchain:
+
+```sh
+python3 -m unittest discover -s tests/host
+```
+
+The decoder is stdlib-only by design so this stays true. See `tests/host/README.md` for how the CBOR
+fixtures are regenerated from the firmware encoder's actual output.
+
 ## Before committing
 
 1. Both builds pass (survey overlay **and** default).

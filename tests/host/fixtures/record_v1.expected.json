@@ -1,0 +1,245 @@
+{
+  "gnssAfter": {
+    "acc": 18.3,
+    "alt": 25.0,
+    "hdg": 275.5,
+    "lat": 37.7713,
+    "lon": -122.4310404,
+    "satsUsed": 6,
+    "spd": 31.25
+  },
+  "gnssBefore": {
+    "acc": 18.3,
+    "alt": 25.0,
+    "hdg": 275.5,
+    "lat": 37.7712317,
+    "lon": -122.4310404,
+    "satsUsed": 6,
+    "spd": 31.25
+  },
+  "lte": [
+    {
+      "earfcn": 2300,
+      "eci": 21414146,
+      "mcc": 310,
+      "mnc": 260,
+      "nmr": [
+        {
+          "earfcn": 650,
+          "pci": 100,
+          "rsrp": -81,
+          "rsrpIndex": 60,
+          "rsrq": -9.5,
+          "rsrqIndex": 21,
+          "timeDiff": 32
+        },
+        {
+          "earfcn": 650,
+          "pci": 101,
+          "rsrp": -81,
+          "rsrpIndex": 60,
+          "rsrq": -9.5,
+          "rsrqIndex": 21,
+          "timeDiff": 32
+        },
+        {
+          "earfcn": 650,
+          "pci": 102,
+          "rsrp": -81,
+          "rsrpIndex": 60,
+          "rsrq": -9.5,
+          "rsrqIndex": 21,
+          "timeDiff": 32
+        },
+        {
+          "earfcn": 650,
+          "pci": 103,
+          "rsrp": -81,
+          "rsrpIndex": 60,
+          "rsrq": -9.5,
+          "rsrqIndex": 21,
+          "timeDiff": 32
+        },
+        {
+          "earfcn": 650,
+          "pci": 104,
+          "rsrp": -81,
+          "rsrpIndex": 60,
+          "rsrq": -9.5,
+          "rsrqIndex": 21,
+          "timeDiff": 32
+        },
+        {
+          "earfcn": 650,
+          "pci": 105,
+          "rsrp": -81,
+          "rsrpIndex": 60,
+          "rsrq": -9.5,
+          "rsrqIndex": 21,
+          "timeDiff": 32
+        },
+        {
+          "earfcn": 650,
+          "pci": 106,
+          "rsrp": -81,
+          "rsrpIndex": 60,
+          "rsrq": -9.5,
+          "rsrqIndex": 21,
+          "timeDiff": 32
+        },
+        {
+          "earfcn": 650,
+          "pci": 107,
+          "rsrp": -81,
+          "rsrpIndex": 60,
+          "rsrq": -9.5,
+          "rsrqIndex": 21,
+          "timeDiff": 32
+        },
+        {
+          "earfcn": 650,
+          "pci": 108,
+          "rsrp": -81,
+          "rsrpIndex": 60,
+          "rsrq": -9.5,
+          "rsrqIndex": 21,
+          "timeDiff": 32
+        },
+        {
+          "earfcn": 650,
+          "pci": 109,
+          "rsrp": -81,
+          "rsrpIndex": 60,
+          "rsrq": -9.5,
+          "rsrqIndex": 21,
+          "timeDiff": 32
+        }
+      ],
+      "rsrp": -87,
+      "rsrpIndex": 54,
+      "rsrq": -10.5,
+      "rsrqIndex": 19,
+      "tac": 14453
+    },
+    {
+      "earfcn": 5110,
+      "eci": 170307089,
+      "mcc": 310,
+      "mnc": 410,
+      "rsrp": -72,
+      "rsrpIndex": 69,
+      "rsrq": -11.0,
+      "rsrqIndex": 18,
+      "tac": 35634
+    },
+    {
+      "earfcn": 5110,
+      "eci": 170307090,
+      "mcc": 310,
+      "mnc": 410,
+      "rsrp": -72,
+      "rsrpIndex": 69,
+      "rsrq": -11.0,
+      "rsrqIndex": 18,
+      "tac": 35634
+    },
+    {
+      "earfcn": 5110,
+      "eci": 170307091,
+      "mcc": 310,
+      "mnc": 410,
+      "rsrp": -72,
+      "rsrpIndex": 69,
+      "rsrq": -11.0,
+      "rsrqIndex": 18,
+      "tac": 35634
+    }
+  ],
+  "networkMode": "LTE-M",
+  "offsets": {
+    "cellEndMs": 4700,
+    "cellStartMs": 120,
+    "gnssAfterMs": 6800,
+    "wifiEndMs": 4650,
+    "wifiStartMs": 130
+  },
+  "profile": "DEEP",
+  "sequence": 42,
+  "tBase": 1786140992000,
+  "timeBase": "unix",
+  "version": 1,
+  "wifi": {
+    "accessPoints": [
+      {
+        "band": "5GHz",
+        "channel": 116,
+        "frequency": 5580,
+        "macAddress": "94:2a:6f:c4:48:00",
+        "signalStrength": -40
+      },
+      {
+        "band": "5GHz",
+        "channel": 116,
+        "frequency": 5580,
+        "macAddress": "94:2a:6f:c4:48:01",
+        "signalStrength": -41
+      },
+      {
+        "band": "5GHz",
+        "channel": 116,
+        "frequency": 5580,
+        "macAddress": "94:2a:6f:c4:48:02",
+        "signalStrength": -42
+      },
+      {
+        "band": "5GHz",
+        "channel": 116,
+        "frequency": 5580,
+        "macAddress": "94:2a:6f:c4:48:03",
+        "signalStrength": -43
+      },
+      {
+        "band": "5GHz",
+        "channel": 116,
+        "frequency": 5580,
+        "macAddress": "94:2a:6f:c4:48:04",
+        "signalStrength": -44
+      },
+      {
+        "band": "5GHz",
+        "channel": 116,
+        "frequency": 5580,
+        "macAddress": "94:2a:6f:c4:48:05",
+        "signalStrength": -45
+      },
+      {
+        "band": "5GHz",
+        "channel": 116,
+        "frequency": 5580,
+        "macAddress": "94:2a:6f:c4:48:06",
+        "signalStrength": -46
+      },
+      {
+        "band": "5GHz",
+        "channel": 116,
+        "frequency": 5580,
+        "macAddress": "94:2a:6f:c4:48:07",
+        "signalStrength": -47
+      },
+      {
+        "band": "5GHz",
+        "channel": 116,
+        "frequency": 5580,
+        "macAddress": "94:2a:6f:c4:48:08",
+        "signalStrength": -48
+      },
+      {
+        "band": "5GHz",
+        "channel": 116,
+        "frequency": 5580,
+        "macAddress": "94:2a:6f:c4:48:09",
+        "signalStrength": -49
+      }
+    ]
+  }
+}
