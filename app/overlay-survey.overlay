@@ -60,3 +60,15 @@
 		};
 	};
 };
+
+/* An 816-byte record written through a 64-byte cache is thirteen program operations, and the
+ * directory metadata that fs_open() walks on every store is read through the same cache.
+ * 256 measured 18-24 % faster per store and cut the growth rate by 29 %; see the table in
+ * overlay-survey.conf, which also carries the CONFIG_FS_LITTLEFS_CACHE_SIZE that must move
+ * with this property.
+ *
+ * Must divide the 4096-byte block and be a multiple of read-size and prog-size (16 each).
+ */
+&lfs1 {
+	cache-size = <256>;
+};
