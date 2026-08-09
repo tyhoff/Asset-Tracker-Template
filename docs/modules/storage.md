@@ -192,6 +192,26 @@ The choice applies to every registered type. There is no per-type override.
 
 A failed `store()` also **skips the buffer-threshold check**. Nothing was added, so the count is unchanged and the check could only re-announce a threshold that was already announced — which under `FULL_STOP` would mean one `STORAGE_THRESHOLD_REACHED` per capture, forever, once the partition filled. The state machine reads that message as "send now".
 
+#### Producer backpressure and the zbus net_buf pool
+
+The storage module is a `ZBUS_MSG_SUBSCRIBER`, so zbus copies every message bound for it into a `net_buf` and the buffer is held until the storage thread retires it. Stores are neither quick nor bounded — LittleFS compacts the record directory's metadata pair on append, and that cost grows with the entry count. Single writes of **14 s** and **43.9 s** were measured on target at only a few hundred entries. A producer that outruns the storage thread therefore drains the pool.
+
+zbus does not report that as an error. `_zbus_vded_exec()` asserts on the failed allocation, and the device reboots:
+
+```
+ASSERTION FAIL @ zephyr/subsys/zbus/zbus.c:252
+net_buf zbus_msg_subscribers_pool is unavailable or heap is full
+<err> os: ***** USAGE FAULT ***** Attempt to execute undefined instruction
+```
+
+So the timeout a publisher passes to `zbus_chan_pub()` is not "give up after this long", it is "panic after this long". `survey_store_publish()` passes `K_FOREVER` for that reason — not because it provides backpressure, but because no finite value can do better and a short one turns an ordinary slow store into a panic.
+
+It is worth being precise about which half of the allocation can wait, because only one can. The `net_buf` *descriptor* comes from a pool of `CONFIG_ZBUS_MSG_SUBSCRIBER_NET_BUF_POOL_SIZE` entries (this application sets **64** in `prj.conf`) and that wait honours the timeout. The buffer's *data* comes from `heap_data_alloc()` under the default `CONFIG_ZBUS_MSG_SUBSCRIBER_BUF_ALLOC_DYNAMIC`, which accepts a `k_timeout_t` and then ignores it in favour of a non-blocking `k_malloc()` on the 12,288-byte system heap. Nothing can wait on that — and since an 816-byte message plus overhead exhausts 12,288 bytes at roughly a dozen in flight, the heap runs out long before the 64 descriptors do. **The blocking half is therefore unreachable in this configuration; every real failure is the non-blocking half asserting.** That is also why raising `CONFIG_HEAP_MEM_POOL_SIZE` only moves the cliff rather than removing it.
+
+Three configurations were tried on target and all three are worse than the problem; `app/overlay-survey.conf` records them in full. In summary: raising `CONFIG_HEAP_MEM_POOL_SIZE` only moves the cliff (32768 still panicked); `CONFIG_ZBUS_MSG_SUBSCRIBER_BUF_ALLOC_STATIC` makes the allocation blocking but the pool is global, so a waiting survey producer starves `power`, `environmental` and `location`, which publish with `PUB_TIMEOUT` and assert in turn; and `CONFIG_ZBUS_MSG_SUBSCRIBER_NET_BUF_POOL_ISOLATION`, which would fix it properly, is broken in NCS 3.4.0 / Zephyr 4.4 — `zbus.h:307` guards the per-channel pool initialiser with `IF_ENABLED(ZBUS_MSG_SUBSCRIBER_NET_BUF_POOL_ISOLATION, ...)`, missing the `CONFIG_` prefix every other reference in that file has, so the pool stays `NULL` and the first publish dereferences it (measured: boot loop at 0.9 s).
+
+**Normal capture is not exposed to any of this.** One record is in flight at a time, 10–30 s apart, so the heap holds a single 816-byte message and the allocation never comes close to failing however slow flash is. Reaching the hazard takes a burst, and the only thing in the build that bursts is the bench command `survey fill` — see `CONFIG_APP_SURVEY_SHELL_FILL`, which is `n` by default and documents how to run long fills in batches.
+
 #### Types with no cloud handler
 
 `send_storage_data_to_cloud()` in `cloud.c` returns `-ENOTSUP` for a storage type it has no branch for. The batch drain treats that as **end of session, do not consume**: the record stays on flash.

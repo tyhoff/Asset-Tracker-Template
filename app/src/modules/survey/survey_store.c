@@ -116,7 +116,46 @@ int survey_store_publish(const struct survey_observation *obs, uint32_t sequence
 	 */
 	memset(staging.cbor + encoded_len, 0, sizeof(staging.cbor) - encoded_len);
 
-	err = zbus_chan_pub(&survey_store_chan, &staging, K_SECONDS(1));
+	/* K_FOREVER rather than a timeout, because a timeout here cannot do what it looks like
+	 * it does and the longest one is the least dangerous.
+	 *
+	 * zbus copies the message into a net_buf for each ZBUS_MSG_SUBSCRIBER -- the storage
+	 * module is one -- and hands this timeout to the allocator. If the allocation fails,
+	 * zbus does not return the -ENOMEM the caller asked for by passing a timeout at all.
+	 * It asserts, and the device reboots:
+	 *
+	 *   ASSERTION FAIL @ zephyr/subsys/zbus/zbus.c:252
+	 *   net_buf zbus_msg_subscribers_pool is unavailable or heap is full
+	 *   <err> os: ***** USAGE FAULT ***** Attempt to execute undefined instruction
+	 *
+	 * So the previous K_SECONDS(1) did not mean "drop this record if storage is
+	 * congested". It meant "panic if a single store takes longer than a second" -- and
+	 * stores that slow are ordinary, because LittleFS compacts the record directory on
+	 * append and that cost grows with the entry count. Single writes of 14 s and 43.9 s
+	 * were measured on target at only a few hundred entries.
+	 *
+	 * K_FOREVER is not backpressure, and it is worth being precise about why, because the
+	 * shape of the pool invites the opposite conclusion. Allocation has two halves. The
+	 * net_buf *descriptor* comes from a 64-entry array (prj.conf sets
+	 * CONFIG_ZBUS_MSG_SUBSCRIBER_NET_BUF_POOL_SIZE) and that wait does honour the
+	 * timeout. The buffer's
+	 * *data* comes from heap_data_alloc(), which accepts a k_timeout_t and then ignores it
+	 * in favour of a non-blocking k_malloc() on the 12288-byte system heap. At 816 bytes
+	 * plus overhead per message the heap runs out around a dozen in flight -- long before
+	 * the 64 descriptors do -- so the blocking half is unreachable and every real failure
+	 * is the non-blocking half asserting. Verified on target.
+	 *
+	 * So K_FOREVER changes nothing observable here. It is chosen because a finite timeout
+	 * can only make things worse: it cannot turn the assert into an -ENOMEM, and it can
+	 * turn an ordinary slow store into a panic. overlay-survey.conf records the three
+	 * configurations tried against the heap limit and why each is worse than the problem.
+	 *
+	 * None of it is reachable from normal capture: one record in flight, 10-30 s apart,
+	 * so the heap holds one 816-byte message and the allocation never comes close. It
+	 * takes a burst -- which today only the bench command "survey fill" produces. See
+	 * docs/modules/storage.md.
+	 */
+	err = zbus_chan_pub(&survey_store_chan, &staging, K_FOREVER);
 
 	k_mutex_unlock(&staging_lock);
 

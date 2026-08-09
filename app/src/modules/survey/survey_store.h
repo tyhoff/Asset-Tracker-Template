@@ -30,8 +30,13 @@
  *
  * survey_store_publish() calls zbus_chan_pub() while holding staging_lock. That is safe
  * only because survey_store_chan has no listeners: the storage module is a
- * ZBUS_MSG_SUBSCRIBER, so publishing is a bounded queue push and the worst case is a
- * concurrent publisher blocking for the 1 s timeout, with priority inheritance in play.
+ * ZBUS_MSG_SUBSCRIBER, so publishing is a queue push rather than a callback run under the
+ * lock. It is not free of consequence, though: if enough messages are in flight that the
+ * system heap cannot back another net_buf, zbus asserts and the device reboots. The
+ * timeout does not prevent that -- see the K_FOREVER rationale in survey_store.c -- so the
+ * worst case of a burst is a panic, not a dropped record. At a 10-30 s cadence there is no
+ * burst: one record is in flight at a time, and the publish never blocks at all.
+ *
  * Adding a ZBUS_OBSERVERS listener to this channel would run that callback in publisher
  * context with staging_lock held, and that is a different and much worse proposition.
  */
@@ -103,7 +108,7 @@ extern const struct zbus_channel survey_store_chan;
  *
  * Encodes @p obs into a record and publishes it on @ref survey_store_chan. Publishing
  * hands the record to the storage module's thread; the write to flash completes some time
- * after this returns. To ask what actually landed, use the upstream `att storage stats`
+ * after this returns. To ask what actually landed, use the upstream `att_storage stats`
  * shell command -- it runs on the storage thread, which is the only thread that may touch
  * the backend's open file handles.
  *

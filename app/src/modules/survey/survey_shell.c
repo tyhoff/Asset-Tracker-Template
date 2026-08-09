@@ -19,6 +19,7 @@
 #include <modem/lte_lc.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <stdlib.h>
 
 #include "app_common.h"
 #include "location.h"
@@ -148,23 +149,17 @@ static int cmd_survey_clear(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
-/* Feeds the cache a synthetic observation and renders it.
- *
- * This makes the cache and the formatter provable on a bench with no SIM, no antenna and
- * no sky view: if "survey selftest" prints sensible values then everything between
- * location_chan and the console is working, and any subsequent empty "survey show" is a
- * radio or plumbing problem rather than a rendering one.
+/* Feeds the cache one synthetic fix and one synthetic scan.
  *
  * The cache is marked synthetic so the injected values cannot later be mistaken for a
  * measurement, whether or not the operator remembers to run "survey clear".
+ *
+ * Shared with "survey fill", which re-injects before every record: the cache ages out
+ * after about a minute, so a load generator that injected once would stop producing
+ * records partway through a long run and look like a storage failure.
  */
-static int cmd_survey_selftest(const struct shell *sh, size_t argc, char **argv)
+static void inject_synthetic(void)
 {
-	ARG_UNUSED(argc);
-	ARG_UNUSED(argv);
-
-	shell_print(sh, "Injecting synthetic GNSS fix and scan...");
-
 	scratch.msg = (struct location_msg){
 		.type = LOCATION_GNSS_DATA,
 		.timestamp = 1767225600000,
@@ -226,6 +221,23 @@ static int cmd_survey_selftest(const struct shell *sh, size_t argc, char **argv)
 	};
 	survey_obs_update(&scratch.msg, 1767225604000, SURVEY_TIME_BASE_UNIX);
 	survey_obs_mark_synthetic();
+}
+
+/* Feeds the cache a synthetic observation and renders it.
+ *
+ * This makes the cache and the formatter provable on a bench with no SIM, no antenna and
+ * no sky view: if "survey selftest" prints sensible values then everything between
+ * location_chan and the console is working, and any subsequent empty "survey show" is a
+ * radio or plumbing problem rather than a rendering one.
+ */
+static int cmd_survey_selftest(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	shell_print(sh, "Injecting synthetic GNSS fix and scan...");
+
+	inject_synthetic();
 
 	survey_obs_snapshot(&scratch.obs);
 	survey_obs_format(&scratch.obs, shell_line_print, (void *)sh);
@@ -334,13 +346,149 @@ static int cmd_survey_store(const struct shell *sh, size_t argc, char **argv)
 	}
 
 	shell_print(sh, "Record %u handed to storage.", store_sequence);
-	shell_print(sh, "Storage writes asynchronously; \"att storage stats\" reports what "
+	shell_print(sh, "Storage writes asynchronously; \"att_storage stats\" reports what "
 			"landed.");
 
 	store_sequence++;
 
 	return 0;
 }
+
+#if defined(CONFIG_APP_SURVEY_SHELL_FILL)
+/* "survey fill <n>" -- bench load generator for the two FW-6 capacity questions.
+ *
+ * Neither question can be answered by driving "survey store" from a host script. The
+ * observation cache ages out after about a minute, so a host loop stores a fraction of
+ * what it sends; and the per-record cost is what has to be measured, so the measurement
+ * cannot be paced by a serial link that is itself the slow part. This runs the loop on
+ * the device, re-injecting the cache before every record.
+ *
+ * Run it in short, well-paced batches. This loop is the one thing in the build that can
+ * reach the zbus hazard documented in overlay-survey.conf and in survey_store_publish():
+ * every record in flight holds one of the shared net_buf buffers until the storage thread
+ * retires it -- a dozen or so at this message size -- and once the heap behind that pool
+ * cannot serve an allocation, zbus asserts and the device reboots mid-measurement:
+ *
+ *   ASSERTION FAIL @ zephyr/subsys/zbus/zbus.c:252
+ *   net_buf zbus_msg_subscribers_pool is unavailable or heap is full
+ *
+ * Measured on target: unpaced, and at 10, 20, 30 and 40 ms, all panic -- differing only in
+ * how long they last first. No fixed interval is safe either, because the number that has
+ * to be outrun is not constant: LittleFS compacts the record directory on append, so the
+ * per-record cost grows with the entry count. 250 ms survives an empty partition and
+ * panics in 8 s at 446 entries.
+ *
+ * So the interval is an argument with a deliberately conservative default rather than a
+ * setting anyone should trust. To fill thousands of records, drive it from the host in
+ * bounded bursts: publish fewer records than the heap behind the pool can back -- about a
+ * dozen -- read the per-record cost out
+ * of the storage log, and pace the next batch off it. A batch that ends in a reboot has
+ * still stored everything it acknowledged, so a long fill survives one -- it just has to
+ * be re-driven. docs/common/dev_workflow.md has the procedure.
+ *
+ * This command's own timing is wall-clock across the whole loop, so it includes the sleeps
+ * and is an upper bound, not a per-record measurement. For that, build with
+ * CONFIG_APP_STORAGE_LOG_LEVEL_DBG and difference the timestamps on the backend's
+ * per-record "Storing data in file ..." lines -- polling "att_storage stats" instead does
+ * not work, because stats is serviced by the very thread being measured. The block cost is
+ * the "fs statvfs" delta.
+ *
+ * The records are synthetic and marked as such in the cache. This command must not be
+ * enabled in a build that will collect real data -- see CONFIG_APP_SURVEY_SHELL_FILL.
+ */
+#define FILL_DEFAULT_INTERVAL_MS 250
+
+static int cmd_survey_fill(const struct shell *sh, size_t argc, char **argv)
+{
+	uint32_t requested;
+	uint32_t interval_ms = FILL_DEFAULT_INTERVAL_MS;
+	uint32_t stored = 0;
+	int64_t start;
+	int64_t elapsed;
+	char *end;
+	int err = 0;
+
+	/* strtoul() accepts a leading '-' and wraps it, so "-1" would parse as 4294967295 and
+	 * start a loop that cannot be interrupted -- a Zephyr shell command owns the shell
+	 * thread until it returns, so there is no ctrl-C. Reject the sign explicitly and bound
+	 * both arguments.
+	 */
+	if (argv[1][0] == '-') {
+		shell_error(sh, "Count must be positive.");
+		return -EINVAL;
+	}
+
+	requested = (uint32_t)strtoul(argv[1], &end, 0);
+	if (*end != '\0' || requested == 0 ||
+	    requested > CONFIG_APP_STORAGE_MAX_RECORDS_PER_TYPE) {
+		shell_error(sh, "Usage: survey fill <count> [interval_ms] (count 1-%d)",
+			    CONFIG_APP_STORAGE_MAX_RECORDS_PER_TYPE);
+		return -EINVAL;
+	}
+
+	if (argc > 2) {
+		if (argv[2][0] == '-') {
+			shell_error(sh, "Interval must be positive.");
+			return -EINVAL;
+		}
+
+		/* Capped at an hour: interval_ms reaches k_msleep(), which takes int32_t, so an
+		 * unbounded value sign-flips into a negative timeout.
+		 */
+		interval_ms = (uint32_t)strtoul(argv[2], &end, 0);
+		if (*end != '\0' || interval_ms > 3600000) {
+			shell_error(sh, "Usage: survey fill <count> [interval_ms] "
+					"(interval 0-3600000)");
+			return -EINVAL;
+		}
+	}
+
+	if (interval_ms == 0) {
+		shell_warn(sh, "Unpaced: this outruns the storage thread and panics the device "
+			       "inside zbus. Measured, not theoretical.");
+	}
+
+	shell_print(sh, "Storing %u synthetic records every %u ms. These are NON-measurements.",
+		    requested, interval_ms);
+
+	start = k_uptime_get();
+
+	for (uint32_t i = 0; i < requested; i++) {
+		inject_synthetic();
+		survey_obs_snapshot(&scratch.obs);
+
+		err = survey_store_publish(&scratch.obs, store_sequence);
+		if (err) {
+			shell_error(sh, "Store failed after %u records (%d).", stored, err);
+			break;
+		}
+
+		store_sequence++;
+		stored++;
+
+		/* Not after the last record: the trailing sleep would land in the wall-clock
+		 * figure printed below and inflate ms/record by a whole interval.
+		 */
+		if (i + 1 < requested) {
+			k_msleep(interval_ms);
+		}
+	}
+
+	elapsed = k_uptime_delta(&start);
+
+	shell_print(sh, "Published %u records in %lld ms (%lld ms/record).",
+		    stored, elapsed, stored ? elapsed / stored : 0);
+	/* "Published" is not "stored": the write happens later on the storage thread, and under
+	 * APP_STORAGE_FULL_STOP a full partition rejects records there, where this loop cannot
+	 * see it. A fill that runs into the cap reports complete success.
+	 */
+	shell_print(sh, "Run \"att_storage stats\" after a moment for what landed -- publishing "
+			"succeeds even when the partition is full -- and "
+			"\"fs statvfs /att_storage\" for the block cost.");
+
+	return err;
+}
+#endif /* CONFIG_APP_SURVEY_SHELL_FILL */
 #endif /* CONFIG_APP_SURVEY_STORAGE */
 
 /* SHELL_CMD_ARG with zero optional arguments, so that a mistyped "survey show 3" reports
@@ -365,6 +513,12 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_survey,
 	SHELL_CMD_ARG(store, NULL,
 		      "Encode the cached observation and store it on flash",
 		      cmd_survey_store, 1, 0),
+#if defined(CONFIG_APP_SURVEY_SHELL_FILL)
+	SHELL_CMD_ARG(fill, NULL,
+		      "Bench only: store <n> synthetic records, one every [interval_ms] "
+		      "(default 250; no interval is safe unpaced -- see docs)",
+		      cmd_survey_fill, 2, 1),
+#endif
 #endif
 	SHELL_SUBCMD_SET_END
 );

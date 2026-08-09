@@ -60,6 +60,32 @@ config APP_SURVEY_STORAGE
 	  regardless of how much it encodes to. See docs/modules/storage.md and
 	  the note in survey_store.h.
 
+config APP_SURVEY_SHELL_FILL
+	bool "Bench command: survey fill <n>"
+	depends on APP_SURVEY_SHELL && APP_SURVEY_STORAGE
+	help
+	  Adds "survey fill <n>", which stores n synthetic records back to back
+	  and reports the elapsed time. It exists to measure what FW-6 could only
+	  estimate: the real block cost of a full partition, and how store
+	  latency behaves once the record directory holds thousands of files.
+
+	  Drive it from the host in bounded bursts, not in one long run. This
+	  loop is the only thing in the build that can outrun the storage
+	  thread, and doing so exhausts the shared zbus net_buf pool, which
+	  panics rather than fails -- see the hazard note in
+	  overlay-survey.conf. No fixed interval avoids that, because the
+	  per-record cost grows with the directory size. Records the command
+	  acknowledged are on flash either way, so a long fill survives a
+	  reboot; it just has to be re-driven.
+
+	  Default n on purpose. The records it writes are synthetic, and although
+	  they are marked as such in the observation cache, on flash they are
+	  indistinguishable from captures -- a collection build with this enabled
+	  is one mistyped command away from a corrupted data set. Enable it for a
+	  measurement build only:
+
+	    west build ... -- -DCONFIG_APP_SURVEY_SHELL_FILL=y
+
 module = APP_SURVEY
 module-str = Survey
 source "subsys/logging/Kconfig.template.log_config"
