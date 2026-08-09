@@ -361,22 +361,104 @@ one-file-per-block layout that neither accounted for.
 
 **Open questions for on-target verification.**
 
-1. **Metadata cost is estimated, not measured.** The 200–250 blocks for 5,000 directory entries is
-   arithmetic on LittleFS's metadata-pair layout, not an `fs_statvfs()` reading. Fill the partition
-   on target and check the free-block count before trusting the 15 % margin. **Treat this as a gate
-   on the 25,000 figure, not a nice-to-have** — review's position was that 25,000 is defensible only
-   once measured, and that **20,000** (4,000 files, ~32 % free, a clean 7 days at 30 s) is the number
-   to fall back to if the measurement is worse than the arithmetic.
+1. ~~**Metadata cost is estimated, not measured.**~~ **Answered on target (CP5); 25,000 stands, the
+   20,000 fallback is not needed.** Measured with `fs statvfs /att_storage` while adding directory
+   entries, on the real 6,144-block partition:
+
+   | Directory entries | `bfree` |
+   |---|---|
+   | 71 | 6072 |
+   | 252 | 6068 |
+   | 264 | 6066 |
+   | 392 | 6062 |
+
+   **+321 entries cost 10 blocks — about one block per 32 entries.** Those were 1-byte pad files,
+   which LittleFS inlines into the directory (`inline_max = min(block_size/8, cache_size)` = 64 here),
+   so each costs only its name and a short inline record; a `SURVEY_<n>.bin` entry carries a CTZ
+   struct instead and costs somewhat more. Scaling 5,003 entries off the inline rate gives ~155
+   blocks, and the heavier per-entry record puts the real figure in the **200–250 block** range the
+   arithmetic predicted. **~14–15 % spare is confirmed.**
+
+   **Superseded by a direct measurement, which agrees.** The estimate above was later replaced by
+   filling the partition with real `SURVEY_<n>.bin` records rather than inlined pad files, tracking
+   `bfree` from 743 records to 12,007 — half the cap:
+
+   | SURVEY records | 743 | 2743 | 5143 | 8007 | 12007 |
+   |---|---|---|---|---|---|
+   | `bfree` | 5975 | 5553 | 5049 | — | 3602 |
+
+   **42.14 blocks per 200 records**, and that rate did not drift by so much as a block across 11,264
+   records — 40 data blocks plus ~2 of directory metadata, exactly the one-file-per-block model.
+   Extrapolated to 25,000 records: **5,279 of 6,144 blocks, 14.1 % spare.** The estimate said
+   14–15 %; the measurement says 14.1 %. 25,000 stands.
+
+   A separate scare during this measurement was wrong and is recorded so it is not re-derived: the
+   BATTERY and ENVIRONMENTAL types do **not** reserve `MAX_RECORDS_PER_TYPE` blocks each.
+   `lfs_storage_store()` opens with `FS_O_CREATE` and seeks, so files are created lazily and
+   `MAX_RECORDS_PER_TYPE` is a cap, not a reservation — a 280-byte `BATTERY_0.bin` on a device
+   configured for 25,000 records per type is the proof.
 
    Not an open question: Partition Manager does **not** own this layout. The build generates no
    `partitions.yml`, and `build-survey/app/zephyr/zephyr.dts` shows `littlefs_storage` at
    `reg = <0x4d2000 0x1800000>` sourced from `overlay-survey.overlay`, with the `zephyr,fstab`
    node pointing at it. The overlay is what takes effect.
-2. **Store latency as the partition fills.** 5,000 files in one directory, and `fs_open()` does a
-   directory lookup on every store. The header files are held open precisely because LittleFS
-   metadata replay is O(N) (see the comment at the top of `littlefs_backend.c`), but the *data*
-   files are opened and closed per record. If this turns out to matter, the fix is in the backend's
-   file layout, not in the slot size.
+2. ~~**Store latency as the partition fills.**~~ **Measured on target (CP5) to 12,007 records —
+   about half the cap. It grows, it is affordable, and it is two separate costs, not one.**
+
+   Method: `CONFIG_APP_STORAGE_LOG_LEVEL_DBG=y` makes the backend log one timestamped line per
+   record (`Storing data in file ... at offset ...`), so per-record cost is a difference of two
+   *device* timestamps with nothing on the host competing with the thread being measured. Records
+   were added in completion-driven bursts of 8 — see `docs/common/dev_workflow.md` for why no timed
+   producer is safe. The numbers below are medians over 200-record windows.
+
+   **Cost 1 — the directory lookup, which grows linearly.** `fs_open()` per store is O(entries):
+
+   | Records | 1200 | 2400 | 3600 | 4800 | 5000 | 6000 | 8000 | 10000 | 12000 |
+   |---|---|---|---|---|---|---|---|---|---|
+   | Median (ms) | 202 | 274 | 341 | 406 | 163 | 221 | 340 | 437 | 530 |
+
+   Two straight segments — **57 ms per 1,000 records** before the drop, **52 ms** after — with one
+   drop back to the floor at ~5,000. The drop did **not** repeat at 10,000, so it is not periodic and
+   nothing should be designed around it. Taking the pessimistic reading (no further drop), the median
+   at the 25,000 cap is **~1.2–1.5 s**. That is the figure to plan against.
+
+   **Cost 2 — LittleFS metadata compaction, which does not grow.** About **3.0–3.7 %** of stores
+   stall for 8–35 s (worst single write observed: 43.9 s), flat from 100 files to 2,400 files. These land mid-file as often as at file
+   boundaries, so they are metadata-pair compaction, not file creation, and they are bounded by the
+   metadata pair rather than by the directory. Mean stall drifts up only mildly (14.3 s → 17.5 s
+   across the run).
+
+   **Aggregate, including stalls: 0.79 → 1.11 s per record** over the same span. At the FW-7 cadence
+   of 10–30 s that is a **3–11 % duty cycle** (0.79 s at 30 s through 1.11 s at 10 s), so FW-6 is not
+   latency-bound and the one-file-per-block
+   layout stands as built. What the measurement does rule out is any *bursting* producer: the tail,
+   not the median, is what a producer has to survive, and nothing may publish faster than the storage
+   thread retires — see the zbus net_buf hazard in `app/overlay-survey.conf`.
+
+   One anomaly is recorded so it is not re-derived as a filesystem property: records 600–1,000 sat on
+   a flat ~1,230 ms plateau, 5× the surrounding trend. That window is the first ~16 minutes of
+   uptime, when the modem is attaching and the cloud module is retrying CoAP; it never recurred over
+   the following 2.5 hours. It correlates with boot-time contention, not with record count.
+
+   **Acted on: the LittleFS cache went from 64 to 256 bytes.** An 816-byte record through a 64-byte
+   cache is thirteen program operations, and the directory metadata `fs_open()` walks is read
+   through the same cache. Re-running the identical fill on an empty partition:
+
+   | Records | 1200 | 2400 | 3600 | 4800 | Growth | At 25,000 |
+   |---|---|---|---|---|---|---|
+   | cache 64 | 202 | 274 | 341 | 406 | 57 ms/1k | ~1560 ms |
+   | cache 256 | 166 | 214 | 268 | 307 | 41 ms/1k | ~1130 ms |
+
+   **18–24 % faster per store, 29 % off the growth rate, for 1,152 bytes of RAM** — 384 B of bss
+   (`read_buffer_0` and `prog_buffer_0`, 0x40 → 0x100 each) and 768 B of noinit (the file-cache heap,
+   `(256+32)*4 − (64+32)*4`), measured from the two link maps; text and data are unchanged. It does nothing for cost 2 — the stall rate and magnitude are identical
+   in both builds — which is consistent with the two costs being independent. Now in
+   `overlay-survey.overlay` (the `&lfs1` property) plus `overlay-survey.conf`
+   (`CONFIG_FS_LITTLEFS_CACHE_SIZE`); both are required, and changing one alone boot-loops the
+   device with `-ENOMEM` on the second header file.
+
+   If this ever does need fixing further, the lever is the backend's file layout — subdirectories,
+   so the lookup is not O(total entries) — not the slot size and not more cache.
 
 ### FW-7 — Cadence
 
@@ -554,7 +636,7 @@ only derivable from the type's header offsets, which live behind file handles th
 owns exclusively. Adding random access at CP5 would mean either a second reader of those handles (a
 real concurrency hazard for a nice-to-have) or a new backend API. CP8's export protocol has to walk
 every stored record anyway, and resume-from-sequence gives it a real reason to address them; that is
-where indexed access belongs. Until then, counts come from the upstream `att storage stats` command.
+where indexed access belongs. Until then, counts come from the upstream `att_storage stats` command.
 
 Verbose per-step logging behind a Kconfig log level, so a field failure can be diagnosed from a
 serial capture alone.
@@ -571,7 +653,7 @@ hardware**. `native_sim` proofs are the gate for merging; on-target proofs are r
 | **CP2** ✅ | FW-1 struct fields: `channel` + `band` on Wi-Fi, plumbed through `location_helper.c` and `cloud_location.c`; `frequency` derived for display. No cell-struct change — PCI deliberately omitted on identified cells. | **Done.** `tests/module/survey` = **33/33** (frequency derivation across 2.4/5 GHz, absent channel, unrecognised band, channel-outside-band); `tests/module/location` Wi-Fi verifier asserts `channel`/`band` survive onto the zbus message. Survey build FLASH 65.63% / RAM 79.11%; default build also verified so the `cloud_location.c` path is compiled. Storage pipe raised 512→576 (`struct location_msg` grew 492→512, +4 header = 516 required). | **Done.** `survey selftest` renders `channel 6 frequency 2437 MHz band 2.4GHz`; real scan returned 9 APs with channels 1/4/6/11 → 2412/2427/2437/2462 MHz, channels cross-checked against an independent host Wi-Fi scan |
 | **CP3** ✅ | FW-5 CBOR encoder + CDDL + `version` field; `survey hex` encodes the cached observation | **Done.** `tests/module/survey_record` = **23/23**, full `tests/module` = **13/13 configurations**. Absent-not-zero asserted per optional field. **Measured worst case: 583 B** (10 APs + 10 neighbours + 3 GCI + both bracket fixes + all six timestamps), asserted against the 700 B budget rather than printed. Survey build text 384,980 / data 148,794 / bss 186,971; default build also verified. | `survey hex` prints a decodable dump |
 | **CP4** ✅ | HOST-1 decoder `scripts/survey_decode.py` (reads CP3 output) | **Done.** `tests/host` = **58/58**, stdlib only. Golden files are the **exact bytes CP3's encoder emitted**, lifted from the suite by `scripts/survey_fixture.py`, so encoder and decoder are proven against each other rather than against two readings of the CDDL — which is how the `time-base` enum disagreement below was caught. Covers indefinite-length CBOR (what zcbor actually emits), version dispatch, RSRP/RSRQ and Wi-Fi frequency conversion, interpolation, and the quality gate. | Decode a real `survey hex` dump from the device |
-| **CP5** ✅ | FW-6 storage: `SURVEY` record type on the LittleFS backend, 24 MiB partition (`overlay-survey.overlay`), `APP_STORAGE_FULL_STOP`, `survey store` | **Done.** `tests/module/survey_store` = **11 tests × 2 configurations** (`.stop` / `.overwrite`, 0 failures); full `tests/module` = **15/15 configurations**; `tests/host` still **58/58**. The suite drives the real path — `survey_store_publish()` → zbus → storage thread → LittleFS — re-decodes a record read back off flash rather than comparing it to the buffer that wrote it, and reads the ring's offsets back out of the header file *through the filesystem* to show they are on flash rather than cached in RAM. **816 B fixed-stride slot**, chosen to pack the 4096 B erase block 5-up (0.4 % waste). Cap **25,000 records ≈ 2.9 days @ 10 s / 5.8 @ 20 s / 8.7 @ 30 s** — set by the file count, not the byte count; see FW-6 above. Survey build text 412,408 / data 155,998 / bss 191,811 (+27 KB of filesystem code over CP3); default build also verified (text 400,732 / data 155,597 / bss 191,334) since four of the touched files are upstream-owned. Review caught two data-destroying defects, both fixed here: `cloud.c` consumed (deleted) storage records it had no handler for, and `storage.c` re-announced the buffer threshold after a failed store, which under `FULL_STOP` meant one "send now" per capture forever. | **Not yet run** (needs hardware): `att storage stats`, store records, power-cycle, confirm count survives; plus the two measurements FW-6 lists as open — real metadata block cost via `fs_statvfs`, and store latency with 5,000 files in one directory |
+| **CP5** ✅ | FW-6 storage: `SURVEY` record type on the LittleFS backend, 24 MiB partition (`overlay-survey.overlay`), `APP_STORAGE_FULL_STOP`, `survey store` | **Done.** `tests/module/survey_store` = **11 tests × 2 configurations** (`.stop` / `.overwrite`, 0 failures); full `tests/module` = **15/15 configurations**; `tests/host` still **58/58**. The suite drives the real path — `survey_store_publish()` → zbus → storage thread → LittleFS — re-decodes a record read back off flash rather than comparing it to the buffer that wrote it, and reads the ring's offsets back out of the header file *through the filesystem* to show they are on flash rather than cached in RAM. **816 B fixed-stride slot**, chosen to pack the 4096 B erase block 5-up (0.4 % waste). Cap **25,000 records ≈ 2.9 days @ 10 s / 5.8 @ 20 s / 8.7 @ 30 s** — set by the file count, not the byte count; see FW-6 above. Survey build text 412,408 / data 155,998 / bss 191,811 (+27 KB of filesystem code over CP3); default build also verified (text 400,732 / data 155,597 / bss 191,334) since four of the touched files are upstream-owned. Review caught two data-destroying defects, both fixed here: `cloud.c` consumed (deleted) storage records it had no handler for, and `storage.c` re-announced the buffer threshold after a failed store, which under `FULL_STOP` meant one "send now" per capture forever. | **Run on target.** `att_storage stats` reports the SURVEY count, records survive a power cycle, and the metadata block cost is measured — see FW-6 open question 1 above, which this closes: **42.14 blocks per 200 records**, held to within a block from 743 to 12,007 records, which extrapolates to **5,279 of 6,144 blocks at the 25,000 cap — 14.1 % spare**. 25,000 records per type stands and the 20,000 fallback is not needed. The second measurement (store latency at thousands of files) also surfaced a real defect, documented in `app/overlay-survey.conf` and `docs/modules/storage.md`: a producer that outruns the storage thread drains the shared zbus `net_buf` pool, and zbus asserts on the failed allocation instead of returning an error, so the device reboots. Normal capture cannot reach it (one record in flight, 10–30 s apart, against a 12,288-byte heap that holds a dozen — the heap binds well before the 64-entry descriptor pool), and the three available fixes were each measured to be worse than the problem — including `CONFIG_ZBUS_MSG_SUBSCRIBER_NET_BUF_POOL_ISOLATION`, which is broken upstream in Zephyr 4.4 (`zbus.h:307` is missing the `CONFIG_` prefix, so the per-channel pool stays `NULL` and the first publish boot-loops the device). The build keeps upstream defaults and contains the hazard in the bench-only `survey fill` |
 | **CP6** | FW-2/FW-4 paired capture orchestrator: GNSS bracket + scan, all six timestamps | Unit test with faked Location library: assert request **sequence** (GNSS → scan → GNSS), assert no overlap, assert all timestamps populated and ordered | `survey scan` then `survey show` shows two GNSS fixes bracketing the scan; `survey timing` reports real durations |
 | **CP7** | FW-2 profiles FAST/DEEP + gating | Unit test: gating decisions across a speed/power truth table; assert DEEP requests GCI | `survey profile deep` yields multiple full-identity GCI cells; FAST does not |
 | **CP8** | FW-8 export protocol over USB CDC | Unit test: framing, length prefix, checksum, resume-from-sequence | Export to host, verify checksums, interrupt mid-transfer and confirm resume is lossless and non-destructive |

@@ -69,7 +69,7 @@ nrfutil toolchain-manager launch --ncs-version v3.4.0 -- bash -c '
 ```
 
 Both overlays are required. `overlay-survey.overlay` grows `littlefs_storage` from 1 MiB to 24 MiB,
-which is what `CONFIG_APP_STORAGE_MAX_RECORDS_PER_TYPE=30000` in the `.conf` is sized against.
+which is what `CONFIG_APP_STORAGE_MAX_RECORDS_PER_TYPE=25000` in the `.conf` is sized against.
 Building with the `.conf` alone links and flashes, then fails an `__ASSERT` inside the LittleFS
 backend at boot — the assert message names the block counts, so it is diagnosable, but the device is
 dead until it is reflashed. Confirm the partition took by checking the generated devicetree rather
@@ -104,6 +104,19 @@ produces confusing results — a changed Kconfig default in particular may not b
 Use `-p always`, not a bare `--pristine`: the long form takes a value, so `--pristine <source_dir>`
 consumes the source directory as its argument and fails with `invalid choice`.
 
+Keep the `bash -c 'cd ... && west build ...'` wrapper, or make every path absolute. Passing the
+build straight to the launcher — `toolchain-manager launch -- west build ... -DEXTRA_DTC_OVERLAY_FILE=../Asset-Tracker-Template/app/overlay-survey.overlay` —
+resets the working directory, and the relative overlay path then fails inside the devicetree
+preprocessor rather than at argument parsing:
+
+```
+failed to preprocess devicetree files (error code 1):
+  .../thingy91x_nrf9151_ns.dts;.../app/boards/thingy91x_nrf9151_ns.overlay;../Asset-Tracker-Template/app/overlay-survey.overlay;...
+```
+
+The message lists the files and says nothing about which one it could not find, so it reads like a
+syntax error in an overlay that is in fact fine.
+
 ### When a BUILD_ASSERT about buffer size fires
 
 Growing `struct location_msg` can break the storage pipe:
@@ -129,6 +142,30 @@ look for it in the build output rather than expecting the build to stop. Add the
 configuration.
 
 ## Flashing
+
+### Check whether hardware is attached before deciding anything is unverifiable
+
+Do this at the **start** of a session, not when you get to a step that needs it. `nrfutil device
+list` is instant and needs no toolchain wrapper:
+
+```sh
+nrfutil device list
+```
+
+```
+THINGY91X_4694ACC7099
+Product         Thingy:91 X UART
+Ports           /dev/tty.usbmodem102, vcom: 0
+                /dev/tty.usbmodem105, vcom: 1
+Traits          mcuBoot, modem, nordicUsb, serialPorts, usb
+
+Supported devices found: 1
+```
+
+`Supported devices found: 0` means no board. Anything else means the board is there and every
+on-target acceptance item is available — do not write "needs hardware, not run" without having run
+this. That mistake was made once already: CP5 was reported complete with on-target verification
+deferred while the board had been plugged in the whole time.
 
 The Thingy:91 X has no on-board debugger, so flashing goes through MCUboot serial recovery.
 
@@ -235,6 +272,168 @@ absence of logging says nothing about whether the device is healthy. Diagnose fr
 | `at AT+CFUN?` | Is the modem even switched on? |
 
 `survey selftest` remains the fastest way to separate a radio problem from a firmware one.
+
+### A command that reports through the log needs a settle delay before you close the port
+
+`att_storage stats` looks broken from a script. It prints `Storage statistics request initiated.`
+and nothing else, because that is all it does synchronously: the command publishes `STORAGE_STATS`
+on `storage_chan` and returns. The record counts are `LOG_INF` calls in `handle_storage_stats()`,
+which runs later on the storage thread and lands *after* the next prompt:
+
+```
+uart:~$ att_storage stats
+Storage statistics request initiated.
+uart:~$ [00:01:16.072,448] <inf> storage: SURVEY: 325 records
+```
+
+A capture that stops reading when the prompt comes back sees the first line and misses the answer.
+Drain the port for a second or two after any command whose real output is logged rather than
+`shell_print`ed. This cost an afternoon of chasing a log-level problem that was not there — the
+level did have to go up (`CONFIG_APP_STORAGE_LOG_LEVEL_INF=y`; at `WRN` the block is compiled in but
+filtered out), but that was only half of it.
+
+### Do not drive the shell on a fixed timer
+
+`fs write` was fired at one command per 60 ms to create directory entries in bulk. Of 600 commands,
+about 181 landed and one pair overlapped into a mangled filename (`padfs`). The shell has no flow
+control on input, so anything faster than the device can retire is silently lost, and the damage is
+invisible unless you count what actually got created.
+
+The rate is not constant either, which is what makes a fixed delay unfixable: LittleFS compacts a
+directory's metadata pair on **every** append, so appending is O(entries) and the write rate falls
+as the directory grows. Wait for the `uart:~$` prompt after each command instead. Allow a generous
+per-command timeout — a write that triggers a metadata-pair split takes far longer than the median.
+
+### Bulk `survey store` is rate-limited by the observation cache, not by storage
+
+Repeating `survey store` in a loop stores far fewer records than commands sent, and the misses are
+not storage failures: the cached observation ages out after about a minute and the command then
+prints `Nothing cached. Run "survey scan", "survey gnss" or "survey selftest" first.` Batches of 50
+degraded to 14 landing per batch as the run went on. Re-issue `survey selftest` every few stores to
+refresh the cache, and count what landed with `att_storage stats` rather than trusting the number of
+commands sent.
+
+### `survey fill` has to be driven in bounded bursts, and no fixed interval is safe
+
+The bench fill command publishes onto a zbus channel whose subscriber is the storage module, so
+every record in flight holds a `net_buf` — drawn from a 64-entry descriptor pool but backed by the
+shared 12,288-byte system heap, which is what actually runs out, at roughly a dozen 816-byte records
+in flight — until the storage thread retires it. Exhaust the heap and zbus **asserts** rather than
+returning an error — `ASSERTION FAIL @
+zephyr/subsys/zbus/zbus.c:252`, then a usage fault and a reboot. The full analysis, including the
+three configurations tried against it and why each is worse, is in `app/overlay-survey.conf` and
+`docs/modules/storage.md`.
+
+What matters for driving the bench: **pacing does not fix it.** Unpaced, and 10, 20, 30, 40 and
+250 ms pacing all panic; they differ only in how long they survive first. The reason is that the
+number to outrun is not constant — LittleFS compacts the record directory on append, so the
+per-record cost grows with the entry count. 250 ms is fine on an empty partition and panics in 8 s
+at 446 entries.
+
+So grow the directory from the host, adaptively:
+
+1. `survey fill 10 0` — a burst that stays under the ~dozen the heap can back, so no allocation
+   fails. Note the bound is the heap, not the 64-entry descriptor pool; sizing a burst off the
+   descriptor count gives an answer that panics.
+2. Read the per-record cost out of the device's own log (below).
+3. `survey fill 90 <3x that cost>` to grow, then repeat.
+
+A run that ends in a panic has still stored everything the command acknowledged, so it can simply be
+restarted; the sequence numbering restarts, which does not matter for synthetic records.
+
+### Measure store latency from the storage log, not by polling `att_storage stats`
+
+Polling `att_storage stats` to see when records land does not work: `stats` is serviced by the
+storage thread, so a poll loop competes with the exact thread it is trying to measure — and the run
+that tried it produced no rows in fifteen minutes while a single manual store completed fine.
+
+Build with `CONFIG_APP_STORAGE_LOG_LEVEL_DBG=y` instead. `littlefs_backend.c` then emits one
+timestamped line per record:
+
+```
+[00:00:28.790,000] <dbg> lfs_backend: Storing data in file /att_storage/SURVEY_89.bin at offset ...
+```
+
+The per-record cost is a difference of two device timestamps, with no host involvement at all. First
+measurement, at 447 records / 89 files: **min 140 ms, median 172 ms, max 203 ms**, with the larger
+values falling on the record that opens a new file. `scratchpad/burst.py` measures one burst;
+`scratchpad/curve5.py` walks the directory up in completion-driven bursts and prints the curve — it
+is the one that works, and it is what produced the FW-6 numbers in `REQUIREMENTS.md`.
+
+Three things about reading that curve, each of which cost a wrong conclusion first:
+
+**Bin the raw log, do not trust the summary rows.** The driver prints a median every 200 records,
+and at that resolution the curve looks like a clean straight line — a regression over twelve rows
+fit to within 2 % and predicted 1.5 s at the record cap. Re-binning the same raw log at 100 records
+showed the median is *not* monotonic: it climbs for thousands of records, then drops back to the
+floor. Fit a line to the rows and the drop hides inside the residuals.
+
+**A pattern seen once is not a period.** That drop happened at ~5,000 records, which made a
+sawtooth look obvious and would have made the latency bounded and the whole question moot. Running
+7,000 records further showed it does *not* repeat at 10,000. One reset is an event, not a period;
+the conservative model — keep climbing — is the one to plan against until a second reset is seen.
+
+**Separate cost that grows from cost that does not.** The median (directory lookup, O(entries)) and
+the multi-second compaction stalls (~3 % of stores) move independently, and averaging them together
+hides both. Bin the medians excluding outliers, then count and average the outliers separately.
+
+Anything measured in the first ~15 minutes of uptime is contaminated. A window at 600–1,000 records
+sat 5× above the surrounding trend and looked like a filesystem property; it was the modem attaching
+and the cloud module retrying CoAP, and it never recurred over the next 2.5 hours. Let the device
+settle before starting a run, or discard the opening window.
+
+### Changing the LittleFS cache size takes a devicetree change *and* a Kconfig change
+
+The `cache-size` property on the `zephyr,fstab,littlefs` node sets the cache each open file
+allocates. It does **not** size the heap those allocations come from — that is derived from
+`CONFIG_FS_LITTLEFS_CACHE_SIZE` × `CONFIG_FS_LITTLEFS_NUM_FILES` (plus
+`CONFIG_FS_LITTLEFS_HEAP_PER_ALLOC_OVERHEAD_SIZE` per file) whenever
+`CONFIG_FS_LITTLEFS_FC_HEAP_SIZE` is left at its default of 0.
+
+Raise only the devicetree property and the build succeeds, flashes, and boot-loops. The backend
+opens the first header file, then fails the second with `-ENOMEM`:
+
+```
+init_header_files: Opened header file /att_storage/BATTERY.header (read_offset=0, write_offset=0)
+<err> fs: file open error (-12)
+<err> lfs_backend: Failed to open header file /att_storage/ENVIRONMENTAL.header: -12
+ASSERTION FAIL @ .../storage/backends/littlefs_backend.c:499
+```
+
+Nothing in that output mentions caches, so it reads as filesystem corruption. Confirm the two
+numbers agree instead — the boot banner prints the devicetree side:
+
+```
+<inf> littlefs: partition sizes: rd 16 ; pr 16 ; ca 256 ; la 32
+$ grep FS_LITTLEFS_CACHE_SIZE build-*/app/zephyr/.config
+```
+
+`CONFIG_FS_LITTLEFS_NUM_FILES` is 4 here, and the backend needs exactly 4 — three header files plus
+the data file it opens per record — so there is no slack to absorb the mismatch.
+
+### Wiping the LittleFS partition
+
+Use the shell command, not the flash driver:
+
+```
+att_storage clear
+```
+
+`flash erase GD25LE255E@0 0x4d2000 0x1800000` reports success and does not wipe anything — the files
+are still there after a cold reboot. `att_storage clear` (`storage_shell.c`) runs
+`lfs_storage_clear()`, which closes the header files, unlinks every entry in the mount, and re-opens
+them. Unlinking during an `fs_readdir()` walk is safe despite appearing not to be: LittleFS fixes up
+open directory cursors on delete (`lfs.c`, `d->id -= 1` in the `LFS_TYPE_DELETE` fixup inside
+`lfs_dir_commit`), so the single pass does not skip entries. It is slow on a full partition — it is
+one `fs_unlink()` per file — so allow minutes, not seconds: **229 s to remove 2,400 files**, ending
+at `bfree 6140` of 6144 and 0 records for every type. Give the driver a timeout in the hundreds of
+seconds or it will look like a hang.
+
+Two related traps. `CONFIG_RESET_ON_FATAL_ERROR=n` does not keep the device up here — it still
+reboots, and the log shows `Reset Cause: Software Reset`. And a device that reboots before the shell
+comes up cannot be diagnosed with a prompt-synced driver at all: the driver hangs waiting for a
+prompt that never arrives. Kill it and read raw serial for ten seconds instead. That is how the
+`NET_BUF_POOL_ISOLATION` boot loop was identified.
 
 ## Unit tests
 
@@ -404,6 +603,23 @@ fixtures are regenerated from the firmware encoder's actual output.
 2. Unit tests pass, and any new test appears in the per-test output.
 3. Behaviour verified on target — every commit must be flashable and working, not merely compiling.
 4. A senior-firmware-engineer review of the changeset in a separate context.
+
+### Check Kconfig claims against the generated `.config`, not against upstream defaults
+
+A comment that names a Kconfig value has to be read out of `build-*/app/zephyr/.config`, because
+this application overrides plenty of upstream defaults and the override is not visible from the
+Zephyr source. The CP5 write-up asserted a 16-entry zbus `net_buf` pool — Zephyr's default — in four
+files, while `app/prj.conf` had been setting `CONFIG_ZBUS_MSG_SUBSCRIBER_NET_BUF_POOL_SIZE=64` all
+along. That is not a harmless slip: the bench procedure above sized `survey fill` bursts off the
+pool figure, and the real ceiling is the 12,288-byte system heap (roughly a dozen 816-byte messages
+in flight), which binds long before either descriptor count. Sizing a burst off "64" panics the
+device.
+
+The general form: when two limits could bind, measure or derive which one does rather than quoting
+whichever is easier to find. Same applies to RAM figures — take them from the two link maps
+(`grep` the symbol in `build-*/app/zephyr/zephyr.map`) rather than reasoning about the Kconfig
+arithmetic, which is how a 1,536-byte estimate stood in for an actual 1,152 bytes, 768 of it in
+`.noinit` rather than `.bss`.
 
 ## Editor diagnostics
 
