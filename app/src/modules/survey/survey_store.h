@@ -123,6 +123,41 @@ extern const struct zbus_channel survey_store_chan;
  */
 int survey_store_publish(const struct survey_observation *obs, uint32_t sequence);
 
+/**
+ * @brief Encode an already-assembled record and publish it for storage.
+ *
+ * The capture orchestrator's entry point. It differs from @ref survey_store_publish in what
+ * it can express, not in how it stores: an observation cache holds the latest fix and the
+ * latest scan with no relationship between them, whereas a capture cycle knows which fixes
+ * bracket which scan and when each measurement happened relative to the others. Those are
+ * the fields the host needs to interpolate ground truth, and there is nowhere to put them
+ * on the observation path.
+ *
+ * @p record is read for the duration of the call and not retained.
+ *
+ * @param record Record to encode. @c sequence is taken from the record itself, so that the
+ *               number in the log, in the timing report and on flash cannot disagree.
+ *
+ * @retval 0 on success.
+ * @retval -EINVAL if @p record is NULL, or if the cycle produced neither a fix nor a scan.
+ * @retval negative errno from the encoder or from zbus otherwise.
+ */
+int survey_store_publish_record(const struct survey_record_data *record);
+
+/** @brief Take the next record sequence number for this boot.
+ *
+ * The single source for both store paths. Sequence numbers restart at zero every boot;
+ * they order records within one run and nothing more.
+ *
+ * Every caller that is going to write a record must draw from here rather than keep its
+ * own counter. Two counters means two records claiming the same sequence in one boot, and
+ * a host decoder that orders or de-duplicates on the field would then mis-order or drop a
+ * real measurement -- with nothing on the device to indicate it happened.
+ *
+ * Safe from any thread.
+ */
+uint32_t survey_store_next_sequence(void);
+
 #ifdef __cplusplus
 }
 #endif

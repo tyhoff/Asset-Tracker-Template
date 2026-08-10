@@ -18,6 +18,10 @@ target_sources_ifdef(CONFIG_APP_SURVEY_STORAGE app PRIVATE
 	${CMAKE_CURRENT_SOURCE_DIR}/survey_store.c
 )
 
+target_sources_ifdef(CONFIG_APP_SURVEY_CAPTURE app PRIVATE
+	${CMAKE_CURRENT_SOURCE_DIR}/survey_capture.c
+)
+
 target_include_directories(app PRIVATE .)
 
 # Generate the record encoder and decoder from the CDDL schema. Same pattern as

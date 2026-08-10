@@ -25,6 +25,7 @@ import argparse
 import pathlib
 import re
 import sys
+from typing import Optional, Sequence
 
 FIXTURE_RE = re.compile(
     r"-----BEGIN FIXTURE (\w+)-----\s*(.*?)\s*-----END FIXTURE \1-----",
@@ -34,7 +35,7 @@ FIXTURE_RE = re.compile(
 DEFAULT_OUT = pathlib.Path(__file__).resolve().parent.parent / "tests" / "host" / "fixtures"
 
 
-def main(argv=None):
+def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("handler_log", help="twister handler.log from the survey_record suite")
     parser.add_argument("-o", "--out-dir", type=pathlib.Path, default=DEFAULT_OUT,
@@ -66,7 +67,7 @@ def main(argv=None):
     return 0
 
 
-def _schema_version(blob):
+def _schema_version(blob: bytes) -> int:
     """Read the schema version out of an encoded record or session header."""
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     from survey_decode import cbor_decode_one

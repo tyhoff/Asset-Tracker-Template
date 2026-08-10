@@ -41,10 +41,15 @@ import select
 import sys
 import threading
 import time
+from typing import Optional
 
 try:
     import serial
     from serial.tools import list_ports
+    # Only for annotations, but imported here with the rest of pyserial so a
+    # missing package still produces the message below rather than a bare
+    # ImportError from a line above the guard.
+    from serial.tools.list_ports_common import ListPortInfo
 except ImportError:
     sys.exit(
         "pyserial is required. The nRF Connect SDK toolchain already provides it, so\n"
@@ -78,7 +83,7 @@ ANSI_OTHER_RE = re.compile(r"\x1b[\x40-\x4f\x51-\x5a\x5c]")
 MAX_ESCAPE_LEN = 32
 
 
-def strip_ansi(text):
+def strip_ansi(text: str) -> str:
     """Remove terminal escape sequences and bare carriage returns."""
     text = ANSI_STRING_RE.sub("", text)
     text = ANSI_CSI_RE.sub("", text)
@@ -86,7 +91,7 @@ def strip_ansi(text):
     return text.replace("\r", "")
 
 
-def candidate_ports():
+def candidate_ports() -> list[ListPortInfo]:
     """Return plausible device ports, Nordic ones first.
 
     Nordic-VID ports sort first, but non-Nordic ports are still returned: a
@@ -110,7 +115,7 @@ def candidate_ports():
     return nordic + others
 
 
-def describe_port(port):
+def describe_port(port: ListPortInfo) -> str:
     vid = f"{port.vid:04x}" if port.vid is not None else "----"
     pid = f"{port.pid:04x}" if port.pid is not None else "----"
     bits = [f"{port.device:<28} {vid}:{pid}"]
@@ -125,7 +130,7 @@ def describe_port(port):
     return "  ".join(bits)
 
 
-def drain(ser, quiet_for=0.15, max_wait=1.5):
+def drain(ser: serial.Serial, quiet_for: float = 0.15, max_wait: float = 1.5) -> None:
     """Discard buffered output until the line has been quiet for a moment.
 
     reset_input_buffer() alone is not enough: the shell prints a prompt after
@@ -141,7 +146,8 @@ def drain(ser, quiet_for=0.15, max_wait=1.5):
             return
 
 
-def read_until_idle(ser, timeout, quiet_for, prompt, require=None):
+def read_until_idle(ser: serial.Serial, timeout: float, quiet_for: float, prompt: str,
+                    require: Optional[str] = None) -> tuple[str, str]:
     """Accumulate output until the prompt returns, or the line goes quiet.
 
     Returns (text, reason). Waiting for the prompt is the fast path; the
@@ -183,7 +189,7 @@ def read_until_idle(ser, timeout, quiet_for, prompt, require=None):
     return strip_ansi(bytes(buf).decode("utf-8", "replace")), reason
 
 
-def monitor(ser, timeout):
+def monitor(ser: serial.Serial, timeout: float) -> int:
     """Print incoming output as it arrives, until the timeout expires.
 
     Streams rather than buffering: the point of this mode is watching a device
@@ -224,7 +230,7 @@ def monitor(ser, timeout):
     return 0
 
 
-def clean_reply(text, command, prompt):
+def clean_reply(text: str, command: str, prompt: str) -> str:
     """Drop the echoed command and the trailing prompt from captured output."""
     lines = text.split("\n")
     if command:
@@ -246,7 +252,8 @@ def clean_reply(text, command, prompt):
     return "\n".join(lines).strip("\n")
 
 
-def send_command(ser, command, timeout, quiet_for, prompt):
+def send_command(ser: serial.Serial, command: str, timeout: float, quiet_for: float,
+                 prompt: str) -> tuple[str, str]:
     """Write one command and return its reply."""
     ser.reset_input_buffer()
     drain(ser)
@@ -259,7 +266,7 @@ def send_command(ser, command, timeout, quiet_for, prompt):
     return clean_reply(text, command, prompt), reason
 
 
-def wake_shell(ser, prompt, timeout=2.0):
+def wake_shell(ser: serial.Serial, prompt: str, timeout: float = 2.0) -> str:
     """Send a bare return so the shell prints a prompt, then swallow it."""
     ser.reset_input_buffer()
     ser.write(b"\r")
@@ -269,7 +276,7 @@ def wake_shell(ser, prompt, timeout=2.0):
     return text
 
 
-def do_list():
+def do_list() -> int:
     ports = candidate_ports()
     if not ports:
         print("No candidate serial ports found.")
@@ -283,7 +290,8 @@ def do_list():
     return 0
 
 
-def do_identify(baud, timeout, prompt, quiet_for, probe_all):
+def do_identify(baud: int, timeout: float, prompt: str, quiet_for: float,
+                probe_all: bool) -> int:
     ports = candidate_ports()
     if not ports:
         print("No candidate serial ports found.")
@@ -366,12 +374,41 @@ class FakeShell(threading.Thread):
         ),
     }
 
-    def __init__(self, fd):
+    def __init__(self, fd: int) -> None:
         super().__init__(daemon=True)
         self.fd = fd
         self.stop = threading.Event()
+        self.observations = 0
 
-    def run(self):
+    def survey_show(self) -> str:
+        """Impersonate a device whose trigger goes nowhere but whose radios are busy.
+
+        The observation counters climb on every look, as they do on a real device that
+        is sampling on its own timer, while the location module's acceptance counter
+        never moves -- nothing ever asked it for anything.
+
+        That combination is precisely the regression the hardware harness's trigger
+        correlation exists to catch, and it is the reason this method is a function
+        rather than a constant string. A fake with frozen observation counters would let
+        a harness that checks only "did a result appear" pass this test too, so it would
+        prove nothing about the correlation.
+        """
+        self.observations += 1
+
+        return (
+            f"Survey observation (gnss #{self.observations}, "
+            f"scan #{self.observations})\n"
+            "GNSS: no fix cached\n"
+            "Scan: none cached\n"
+            # Three fields, matching the device: the harness's counters() requires all
+            # three, and a two-field line would fail to parse rather than fail the
+            # assertion it exists to make. `dropped` stays at zero on purpose -- a rising
+            # `dropped` would make the harness retry and then skip, and this fake is here
+            # to be *failed*, not skipped.
+            "Triggers: accepted 0, dropped 0, suppressed 0"
+        )
+
+    def run(self) -> None:
         # Colour codes and \r\n line endings are deliberate: they are what the
         # real shell sends, and the parser has to survive them.
         line = bytearray()
@@ -404,14 +441,17 @@ class FakeShell(threading.Thread):
                     continue
                 if line:
                     cmd = line.decode("utf-8", "replace").strip()
-                    reply = self.REPLIES.get(cmd, f"{cmd}: command not found")
+                    if cmd == "survey show":
+                        reply = self.survey_show()
+                    else:
+                        reply = self.REPLIES.get(cmd, f"{cmd}: command not found")
                     os.write(self.fd,
                              b"\r\n" + reply.replace("\n", "\r\n").encode())
                     line.clear()
                 os.write(self.fd, b"\r\n\x1b[1;32muart:~$ \x1b[m")
 
 
-def open_loopback():
+def open_loopback() -> tuple[str, "FakeShell"]:
     """Return (port_path, shell) wired to a FakeShell.
 
     The slave is put into raw mode before the shell writes anything. A pty starts
@@ -429,7 +469,7 @@ def open_loopback():
     return os.ttyname(slave), shell
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(
         description="Drive the Zephyr shell on a Thingy:91 X non-interactively.",
         formatter_class=argparse.RawDescriptionHelpFormatter,

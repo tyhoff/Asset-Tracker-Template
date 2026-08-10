@@ -80,28 +80,21 @@ void survey_store_extract(const struct survey_store_msg *msg, struct survey_stor
 	*data = *msg;
 }
 
-int survey_store_publish(const struct survey_observation *obs, uint32_t sequence)
+/* Encode @p record into the staging buffer and publish it. The caller holds staging_lock,
+ * which is what protects both the buffer and @p record's lifetime for the duration.
+ *
+ * Split out so that the two entry points -- an observation from the shell, a completed
+ * capture cycle from the orchestrator -- share one encode-and-publish path. Duplicating it
+ * would mean the K_FOREVER reasoning below has two copies to stay true of.
+ */
+static int stage_and_publish(const struct survey_record_data *record, uint32_t sequence)
 {
 	size_t encoded_len;
 	int err;
 
-	if (obs == NULL) {
-		return -EINVAL;
-	}
-
-	if (!obs->gnss_valid && !obs->scan_valid) {
-		return -EINVAL;
-	}
-
-	k_mutex_lock(&staging_lock, K_FOREVER);
-
-	survey_record_from_obs(obs, sequence, &staged_record);
-
-	err = survey_record_encode(&staged_record, staging.cbor, sizeof(staging.cbor),
+	err = survey_record_encode(record, staging.cbor, sizeof(staging.cbor),
 				   &encoded_len);
 	if (err) {
-		k_mutex_unlock(&staging_lock);
-
 		STORE_WRN("Encode failed (%d); record %u not stored", err, sequence);
 
 		return err;
@@ -156,9 +149,6 @@ int survey_store_publish(const struct survey_observation *obs, uint32_t sequence
 	 * docs/modules/storage.md.
 	 */
 	err = zbus_chan_pub(&survey_store_chan, &staging, K_FOREVER);
-
-	k_mutex_unlock(&staging_lock);
-
 	if (err) {
 		STORE_WRN("Publish failed (%d); record %u not stored", err, sequence);
 
@@ -166,4 +156,69 @@ int survey_store_publish(const struct survey_observation *obs, uint32_t sequence
 	}
 
 	return 0;
+}
+
+/* The one source of record sequence numbers for this boot.
+ *
+ * It lives here rather than in either caller because there are two callers -- the capture
+ * orchestrator and "survey store" -- and they each used to keep their own counter starting
+ * at zero. Both write the result into survey_record_data.sequence on flash, so a bench
+ * session that used both produced two different records claiming the same sequence, and a
+ * host decoder ordering or de-duplicating on that field would mis-order or silently drop a
+ * real measurement.
+ */
+static atomic_t sequence_next;
+
+uint32_t survey_store_next_sequence(void)
+{
+	return (uint32_t)atomic_inc(&sequence_next);
+}
+
+int survey_store_publish(const struct survey_observation *obs, uint32_t sequence)
+{
+	int err;
+
+	if (obs == NULL) {
+		return -EINVAL;
+	}
+
+	if (!obs->gnss_valid && !obs->scan_valid) {
+		return -EINVAL;
+	}
+
+	k_mutex_lock(&staging_lock, K_FOREVER);
+
+	survey_record_from_obs(obs, sequence, &staged_record);
+
+	err = stage_and_publish(&staged_record, sequence);
+
+	k_mutex_unlock(&staging_lock);
+
+	return err;
+}
+
+int survey_store_publish_record(const struct survey_record_data *record)
+{
+	int err;
+
+	if (record == NULL) {
+		return -EINVAL;
+	}
+
+	/* A cycle in which every step failed has nothing to say and is refused. One where
+	 * only GNSS failed is not: the radio observations are the measurement, and a record
+	 * without ground truth still contributes to coverage. The decoder decides what it
+	 * can score, not this function.
+	 */
+	if (!record->scan_valid && !record->gnss_before_valid && !record->gnss_after_valid) {
+		return -EINVAL;
+	}
+
+	k_mutex_lock(&staging_lock, K_FOREVER);
+
+	err = stage_and_publish(record, record->sequence);
+
+	k_mutex_unlock(&staging_lock);
+
+	return err;
 }

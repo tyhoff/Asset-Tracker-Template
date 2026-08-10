@@ -9,9 +9,14 @@
  *
  * A listener rather than a message subscriber, following the same choice the led module
  * makes (ZBUS_LISTENER_DEFINE in led.c): the work here is one struct copy, so it does not
- * warrant a thread, a stack and a task watchdog channel of its own. It also means this
- * feature adds no thread that could hang to an application whose threads are all
- * watchdog-covered.
+ * warrant a thread, a stack and a task watchdog channel of its own.
+ *
+ * The capture orchestrator (survey_capture.c) does add a thread, and it is registered with
+ * the task watchdog like every other thread in this application. That was not true when it
+ * was first written, and the consequence was specific: the record store publishes with
+ * K_FOREVER, so a wedged storage thread would block the capture thread forever, and the
+ * admission semaphore it holds would never be returned -- surveying would stop permanently
+ * with nothing but "a capture is already running" to show for it.
  *
  * The callback runs in the *publisher's* context with the channel mutex held, so it must
  * never block. Do not add anything here that can sleep, take a long lock, or do
@@ -26,6 +31,9 @@
 #include "location.h"
 #include "survey.h"
 #include "survey_obs.h"
+#if defined(CONFIG_APP_SURVEY_CAPTURE)
+#include "survey_capture.h"
+#endif
 
 LOG_MODULE_REGISTER(survey, CONFIG_APP_SURVEY_LOG_LEVEL);
 
@@ -53,11 +61,30 @@ static void survey_location_cb(const struct zbus_channel *chan)
 	int64_t now_ms;
 
 	if (msg->type != LOCATION_GNSS_DATA && msg->type != LOCATION_CLOUD_REQUEST) {
+		/* Lifecycle events (started, done) carry no data, so the orchestrator can be
+		 * woken immediately. It sequences the cycle on these -- a step that misses its
+		 * wake-up stalls until its timeout. Only a k_event post, safe in this context.
+		 */
+		IF_ENABLED(CONFIG_APP_SURVEY_CAPTURE, (survey_capture_notify(msg);));
+
 		return;
 	}
 
 	survey_time_now(&now_ms, &time_base);
 	survey_obs_update(msg, now_ms, time_base);
+
+	/* Result events: notify *after* the cache is written, never before.
+	 *
+	 * The orchestrator's response to this wake-up is survey_obs_snapshot(), so waking it
+	 * first is a race on the data it is about to read. It cannot bite today -- the capture
+	 * thread is K_LOWEST_APPLICATION_THREAD_PRIO and cannot preempt the publisher on a
+	 * uniprocessor -- but the consequence if it ever did is not a crash: step 3 would
+	 * snapshot step 1's fix, still flagged valid, and store a record whose trailing
+	 * bracket is a duplicate of the leading one. Well-formed and silently wrong, which is
+	 * the exact failure the bracketing exists to prevent. Ordering it correctly costs
+	 * nothing, so do not rely on the priority.
+	 */
+	IF_ENABLED(CONFIG_APP_SURVEY_CAPTURE, (survey_capture_notify(msg);));
 
 	/* LOG_INF, not LOG_DBG: this is the confirmation an operator is told to look for
 	 * after running "survey scan", and the module log level defaults to INF.

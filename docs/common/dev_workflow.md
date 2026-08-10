@@ -80,6 +80,26 @@ grep -A3 'littlefs_storage:' build-att-survey/app/zephyr/zephyr.dts
 # reg = < 0x4d2000 0x1800000 >;
 ```
 
+**Fill build** — the survey build plus the bench load generator, which nothing else compiles:
+
+```sh
+nrfutil toolchain-manager launch --ncs-version v3.4.0 -- bash -c '
+    cd /Users/tyler/junk/ncs-3.4.0 &&
+    west build -b thingy91x/nrf9151/ns --sysbuild -d build-att-fill \
+        ../Asset-Tracker-Template/app -- \
+        -DEXTRA_CONF_FILE=overlay-survey.conf \
+        -DEXTRA_DTC_OVERLAY_FILE=overlay-survey.overlay \
+        -DCONFIG_APP_SURVEY_SHELL_FILL=y
+'
+```
+
+`CONFIG_APP_SURVEY_SHELL_FILL` is `n` by default, so `survey fill`'s code is invisible to both builds
+above. Deleting the file-static `store_sequence` broke it and neither build noticed — the compiler
+reports one undeclared-identifier error per function and the fill function was preprocessed away
+entirely. Any refactor that touches something `survey fill` uses needs this third build. The same
+applies to every other default-off option in `Kconfig.survey`: "it builds" means "the configurations
+you built" and no more.
+
 **Default build** — plain asset-tracker, `CONFIG_APP_SURVEY=n`:
 
 ```sh
@@ -258,10 +278,16 @@ module for minutes.
 Note that `survey clear` resets the counters too, so a `clear` followed by a dropped scan reads as
 `gnss #0, scan #0` and looks like a dead device when it is merely busy.
 
-### Do not diagnose from the log output
+### Do not diagnose from an absence of log output
 
-No log lines appeared on either CDC port during normal bench operation, including across a scan, so
-absence of logging says nothing about whether the device is healthy. Diagnose from the shell instead:
+Originally written as "no log lines appear on either CDC port". That was true of the build at the
+time and is no longer: `overlay-survey.conf` raises the storage, location and network modules to
+`INF`, and the survey module is at `INF` by default (`CONFIG_APP_SURVEY_LOG_LEVEL=3` via
+`..._LOG_LEVEL_DEFAULT`, not an explicit `..._INF` — checked in `build-att-survey/app/zephyr/.config`,
+per the rule below). The console carries their output — the hardware integration tests depend on
+it. What survives is the weaker and still useful form: **absence of logging says nothing about
+whether the device is healthy**, because a module can be silent at the configured level while
+wedged. Diagnose from the shell:
 
 | Command | Answers |
 |---|---|
@@ -451,6 +477,12 @@ On arm64 the platform must be `native_sim/native/64`; plain `native_sim` sets `C
 aborts with "this Aarch64 machine has a 64-bit userspace". The script defaults to the 64-bit
 variant.
 
+Do not reach for `twister -p native_sim` directly to run one suite in a hurry. It does not fail — it
+reports **0 configurations selected** and exits 0, because the suites declare the 64-bit platform
+and `native_sim` is statically filtered out. A run that tested nothing and a run in which everything
+passed look identical at a glance. Always go through `scripts/run_unit_tests.sh`, and read the
+configuration count in the summary, not just the exit status.
+
 ### Seeing per-test results
 
 Twister reports a Unity suite as a single test case, so a passing run does **not** prove an
@@ -480,6 +512,34 @@ Tests are registered automatically. `test_runner_generate()` in the suite's `CMa
 generates the Unity runner by scanning for `void test_*(void)` functions, so a new test needs no
 manual registration — but it is silently absent if misnamed, which is why the per-test output above
 is worth checking after adding tests.
+
+### Point `-O` outside `/tmp` on this host
+
+`-O /tmp/twister-out/run` fails before any build starts:
+
+```
+PermissionError: [Errno 13] Permission denied: '/work/out/run'
+```
+
+`chmod 777` on the host directory does not help — macOS `/tmp` is a symlink into `/private/tmp`, and
+the container cannot create inside that bind mount whatever its mode. Use a directory under
+`/Users/tyler/junk` instead; `/Users/tyler/junk/twister-out` works. The error names the *container*
+path, which is what makes it look like a mount-mode problem rather than a host-path one.
+
+### Kernel features a unit suite uses have to be enabled in its own `prj.conf`
+
+A unit suite does not inherit the application's Kconfig, so anything the unit under test calls into
+has to be turned on again. The failure is a link error naming the internal symbol rather than the
+feature:
+
+```
+undefined reference to `z_impl_k_event_clear'      -> CONFIG_EVENTS=y
+```
+
+`tests/module/survey_capture/prj.conf` also sets `CONFIG_NATIVE_SIM_SLOWDOWN_TO_REAL_TIME=y`, which
+is the opposite of what the other suites want: its assertions compare measured step durations
+against the fake's sleeps, and at simulated speed those numbers mean nothing. Set it only where a
+suite measures time.
 
 ### A suite that boots and then hangs is missing `main()`
 
@@ -555,6 +615,27 @@ Worth doing for any test whose expected value is zero, empty, or absent, because
 freshly initialised system looks like. The fix for this one was to dirty every slot with a maximal
 record and drain before storing the small record under test.
 
+### A fake built on a message subscriber cannot model a module that discards
+
+The capture suite's fake location module was a `ZBUS_MSG_SUBSCRIBER`. The real location module
+*discards* a trigger that arrives while a search is running; a message subscriber **queues** it. So
+the overlap the tests existed to detect could not occur: the second trigger sat in the queue until
+the fake got round to it, `overlap_detected` was unreachable, and the start/finish ordering
+assertion was tautological. Deleting the orchestrator's `wait_for_idle()` left all of it green.
+
+Serving synchronously made it worse. When `serve()` publishes the result and the done event before
+returning, no other thread can observe the fake as busy — every test agrees the requests did not
+overlap because nothing could have. The fix was to serve **asynchronously**: a `k_work_delayable`
+that sets a `busy` flag, publishes `LOCATION_SEARCH_STARTED`, and returns, so the subscriber thread
+can dequeue an overlapping trigger and discard it exactly as the real module would. The result and
+`LOCATION_SEARCH_DONE` arrive from later work items, with a gap between them — which is also where
+the real library's "result published before done" hazard lives.
+
+Then break the code (above) and count: removing `wait_for_idle()` now fails five tests.
+
+The general rule: a fake has to reproduce the *disposition* of the real module, not just its
+messages. Queueing where the real thing drops turns every sequencing assertion into a tautology.
+
 ### native_sim cannot test a data race
 
 Do not write a two-thread test to prove a mutex is needed. `native_sim` advances its simulated clock
@@ -597,11 +678,277 @@ python3 -m unittest discover -s tests/host
 The decoder is stdlib-only by design so this stays true. See `tests/host/README.md` for how the CBOR
 fixtures are regenerated from the firmware encoder's actual output.
 
+## Hardware integration tests
+
+`tests/hardware/survey_hwtest.py` drives the console and asserts on the replies, so the on-target
+step below is a command rather than a bench session retyped from memory:
+
+```sh
+nrfutil toolchain-manager launch --ncs-version v3.4.0 -- \
+    python3 tests/hardware/survey_hwtest.py --radio
+```
+
+The `nrfutil toolchain-manager launch` prefix is not optional: pyserial is installed in the
+toolchain environment and nowhere else, so a bare `python3 tests/hardware/survey_hwtest.py` on this
+machine stops at "pyserial is required" before it opens the port.
+
+**A run with no flags is not a verification.** It selects 9 of the 22 tests — every case that
+touches the radio or flash is tagged out — and prints `9 passed, 0 skipped, 0 failed` with exit 0.
+That output is indistinguishable at a glance from a full green run, and it was once taken for one
+after a firmware change to the capture path, none of which those 9 tests exercise. The command that
+verifies a firmware change is `--radio --destructive --yes`; read the test count on the first line
+before believing the last one.
+
+Without `--radio` it runs only what needs no network or sky view. That is not the same as harmless:
+it injects synthetic data into the observation cache and then clears it, zeroing the counters, so it
+will confuse a bench session in progress. What it leaves alone is flash and the reset line — the
+tests that append records or cold-boot the device are behind `--destructive`, on a separate axis from
+`--radio`. `--loopback` runs the harness's own self-tests against the fake shell in
+`scripts/survey_console.py`, with no hardware attached — worth doing after editing the harness,
+because a harness that silently fails to read the port reports PASS for everything. See
+`tests/hardware/README.md`.
+
+### Three device behaviours the harness had to be built around
+
+The first two are documented above; what is new there is how long the waits actually are. The third
+is new.
+
+**`att_storage stats` can be silent far longer than "a second or two"** (see *A command that reports
+through the log needs a settle delay*). The storage thread counts every record at mount, and until
+it finishes it answers nothing: measured **silent for about 45 s after a cold boot holding 5,004
+records**, then answering in 1.1 s on every subsequent ask. It is equally unavailable for the
+duration of a store. One silent window is not evidence of a wedged device — ask again.
+
+This does not contradict *Measure store latency from the storage log, not by polling* further down.
+That warning is about **timing** a store, where the poll competes with the thread being timed and
+distorts the number. Asking a few times, seconds apart, for a **count** does not perturb the count.
+Do not reuse the harness's `_survey_count()` to measure latency.
+
+**A dropped trigger costs a whole test window** (see *The first scan after boot is usually
+dropped*). With `CONFIG_LOCATION_REQUEST_DEFAULT_GNSS_TIMEOUT=600000` the startup sample can hold
+the Location library for ten minutes, and the only evidence is one log line:
+
+```
+<wrn> location_module: Location trigger received while a search is active, ignoring
+```
+
+Observed as a `survey scan` that produced nothing for 60 s. The harness's `trigger()` waits the
+running search out and retries, and its reboot tests are registered last so they cannot starve the
+radio tests. **Removed at CP6:** `CONFIG_APP_SURVEY_CAPTURE_OWNS_SEARCH` drops the default
+`LOCATION_SEARCH_TRIGGER`, and the radio tests stopped needing retries — `scan_returns_observations`
+now completes in 8.1 s. Keep the retry logic anyway; it costs nothing when nothing is competing, and
+it is the only thing standing between a busy modem and a false failure.
+
+**A trigger cannot be correlated from the result path at all.** `GNSS fix cached` and `Scan cached`
+come from a zbus listener on `location_chan` that fires for *any* result, including the startup
+sample and the periodic timer, so a test that waits for one passes with the trigger deleted from the
+firmware. The `gnss #N, scan #M` counters in `survey show` are the same signal wearing a different
+hat — `survey_obs_update()` increments them inside that same callback — so switching to them buys
+nothing. Neither does the absence of the `ignoring` warning, which is also absent when no trigger
+arrived.
+
+Closing it takes a token on the *trigger* path. `location.c` counts the triggers it accepts, the ones
+it discards, and the ones `OWNS_SEARCH` suppresses; `survey show` prints
+`Triggers: accepted N, dropped M, suppressed K`. Require both `accepted` and the result counter to
+advance.
+
+`suppressed` is separate from `dropped` because the harness reads a rise in `dropped` as "our trigger
+lost the race" and retries. Counting the application's own suppressed sampling there would make the
+harness abandon triggers that were still pending. Two dispositions, two counters — and `suppressed`
+is also the only outside evidence that the suppression branch exists at all, which is what
+`owns_search_suppresses_the_application_sample` asserts. The general lesson: when a test has to attribute an effect to its own
+stimulus, and the effect is something the system also produces on its own, the observability has to
+be added at the stimulus. No amount of care on the observation side substitutes for it.
+
+### Match a single space in shell output and the test will fail on the longest label
+
+`capture_timing_reports_real_durations` failed on hardware with "no gnss_after in survey timing"
+while the device was printing it. The report is column-aligned, so the padding after each label is
+whatever the *longest* label needs:
+
+```
+gnss_before 1800 ms
+scan        4846 ms
+gnss_after  1154 ms
+```
+
+`gnss_after` gets two spaces. Use `\s+` between a label and its value in every harness regex — the
+gap is layout, not content, and it changes whenever a longer label is added to the same block.
+
+### A ninth task-watchdog client needs a ninth channel
+
+`prj.conf` sets `CONFIG_TASK_WDT_CHANNELS=8`, and upstream uses all eight — main, power, fota,
+location, network, environmental, storage, cloud. Registering the capture thread made a ninth
+caller, `task_wdt_add()` returned `-ENOMEM`, and `SEND_FATAL_ERROR()` rebooted the device on every
+boot.
+
+What that looked like on the bench was **twelve unrelated hardware tests failing at once**, none of
+them about watchdogs, with the only evidence a single `<err> survey_capture: Failed to add capture
+thread to watchdog: -12` line inside one test's captured boot log. Nothing asserted on it.
+
+`overlay-survey.conf` now sets `CONFIG_TASK_WDT_CHANNELS=9`, and the module logs the channel it got
+on success so `capture_thread_is_watchdogged` can require it. Two general points:
+
+- A test suite that goes broadly red is usually one systemic cause, not many. Read the boot log
+  first, before triaging individual tests.
+- When adding a resource-limited registration (watchdog channel, zbus observer, net_buf pool user),
+  check the configured count against the existing users. The failure is at runtime and the resource
+  is fully consumed by upstream in more places than this one.
+- Better still, make it a build error. `survey_capture.c` now carries
+  `BUILD_ASSERT(CONFIG_TASK_WDT_CHANNELS >= 9, ...)`. A misconfiguration that can only present as a
+  boot loop should be caught by the compiler, where the message can name the file to edit.
+
+### Swallowing a zbus message can strand another module's state machine
+
+`CONFIG_APP_SURVEY_CAPTURE_OWNS_SEARCH` suppresses main.c's periodic `LOCATION_SEARCH_TRIGGER` so the
+capture orchestrator owns the radio. The first version simply dropped the message. But
+`LOCATION_SEARCH_DONE` is the **only** exit from main.c's two SAMPLING states (`main.c:1058` and
+`:1164`), and entering one stops the sample timer — so main sat in SAMPLING forever, with no periodic
+power or environmental samples. Silently: main feeds its task watchdog *before* `zbus_sub_wait_msg`,
+not after, so a thread parked on the wait looks perfectly healthy. It unwedged only by accident, when
+a later capture cycle's own DONE happened along.
+
+The fix is to answer, not merely ignore: the suppression branch publishes a synthetic
+`LOCATION_SEARCH_DONE`. That is honest — no search ran, so a search taking zero time is what
+happened.
+
+Two things to carry forward:
+
+- **A request/response message pair is a contract.** Before dropping a request, find every state
+  machine waiting on its response. `grep` for the response type, not the request you are suppressing.
+- **A watchdog fed before a blocking wait proves nothing about progress.** It proves the thread
+  reached the wait. Upstream's module loops are all shaped this way, so a module stuck waiting for a
+  message that will never arrive is invisible to the watchdog by construction. Assert on a state
+  transition instead — `suppressed_trigger_still_releases_main` requires main to enter a WAITING
+  state after the SAMPLING it entered at boot, which the trigger counters cannot see.
+
+### A message published to answer one module is delivered to all of them
+
+The synthetic `LOCATION_SEARCH_DONE` above fixed main.c and broke two other things, because zbus has
+no addressee: every observer of `location_chan` sees it.
+
+- `survey_capture` sequences steps on that exact message. A synthetic DONE arriving mid-step ends the
+  step with the radio still working, so the cycle skips its wind-down wait, publishes the next
+  trigger into a busy modem — which the location module discards — and stores a record carrying one
+  step's timestamps around the next step's measurements. Wrong data, no error anywhere.
+- The location module observes its own channel. Its subscriber FIFO can deliver the synthetic DONE
+  *after* an already-queued capture trigger, returning it to INACTIVE while the library is still
+  searching. The next trigger is then accepted, `location_request()` returns `-EBUSY`, and
+  `location.c:485` calls `SEND_FATAL_ERROR()` — a device reset, from a message published to be
+  helpful.
+
+Both are closed, and the shape of the fixes is the lesson:
+
+- **Publish only when nobody else is listening for that message.** The suppression branch checks
+  `survey_capture_busy()` first; a running cycle publishes a real DONE seconds later, which releases
+  main just as well.
+- **Consumers should qualify what they accept rather than trust the channel.** `survey_capture`'s
+  listener drops any DONE that arrives before its own search has reported `LOCATION_SEARCH_STARTED` —
+  the library reports started before done for every request it accepts, so an earlier done cannot be
+  ours. Gate in the *listener*, not in the waiting thread: a clear at the end of a bounded handshake
+  wait misses a stray message that arrives while a slower started is still pending, and inside the
+  listener the ordering is the channel lock's rather than the scheduler's.
+- **Test the gate by removing it.** `test_a_stray_done_before_started_does_not_end_the_step` makes
+  the fake publish a stray DONE and then report started *later than the orchestrator waits for it*.
+  Without the gate it fails; with the earlier, weaker placement it also fails. A test that only
+  covers the fast path would have passed against both.
+
+### "Busy" is two questions, and answering both with one predicate strands a state machine
+
+Once `location.c` was gating its synthetic DONE on `survey_capture_busy()`, the guard read correctly
+and was still wrong. A capture cycle holds `cycle_slot` from admission until *after*
+`survey_store_publish_record()` returns — tens of seconds once the partition holds thousands of
+records — but its last `LOCATION_SEARCH_DONE` is published well before that. So a suppressed
+application trigger arriving during the store got no DONE and none was ever coming. `DONE` is the
+only exit from main.c's two SAMPLING states and the sample timer is stopped on entry, so main sat
+there with no periodic power or environmental samples, no log line, and a watchdog that is fed
+before the zbus wait rather than after. At CP6, where cycles are started by hand, it would never
+have recovered.
+
+The two callers were asking different questions:
+
+| Caller | Question | Predicate |
+| --- | --- | --- |
+| `survey store` shell command | may I start work that would interleave with the cycle? | `survey_capture_busy()` — the slot |
+| `location.c`'s trigger suppression | is the *radio* spoken for? | `survey_capture_radio_busy()` — cleared after step 3 |
+
+Two lessons worth carrying:
+
+- **A predicate named after a resource should be scoped to that resource**, not to the operation that
+  happens to hold it. `busy` covered the cycle; the guard needed the radio.
+- **Raise the flag in the requester, not in the worker.** `radio_busy` is set in
+  `survey_capture_request()`, before `k_sem_give(&cycle_go)`. The capture thread runs at
+  `K_LOWEST_APPLICATION_THREAD_PRIO` and may not be scheduled for a while, and a flag that reads
+  false in that gap reintroduces the reordering hazard it exists to prevent. This is the same reason
+  `survey_capture_busy()` reads the semaphore rather than a flag the thread sets.
+- **Fake the slow part in the unit test.** `survey_store_publish_record()`'s fake samples both
+  predicates on the capture thread the moment the store begins. That is the only point where the two
+  can be caught disagreeing through the module's public API, and it is what stops
+  `survey_capture_radio_busy()` from being quietly reimplemented as an alias. Verified by deleting
+  the clear: `test_the_radio_is_reported_free_before_the_store_begins` fails.
+
+### Bound every poll loop in a Twister test
+
+`test_busy_is_asserted_for_the_whole_cycle_including_between_steps` polled `while (steps_seen < 3)`
+with no deadline. The regression that loop exists to catch is a cycle that stops short of three
+steps — which would have hung, and Twister kills the binary on a hang, taking the other fourteen
+named results in the file with it. A bounded loop fails one test by name. Use a deadline generous
+against the fake's timing (10 s against a ~300 ms fake cycle); the bound is there to convert a hang
+into a failure, not to measure anything.
+
+### Reboot with `await_line(command=...)`, never `cmd()` then await
+
+`cmd()` reads for its entire timeout before returning, so everything the device logs in those
+seconds lands in *its* reply and is gone by the time the caller starts listening. Issuing a reboot
+that way loses the first ~2 s of boot — which is where the interesting lines are. This cost two
+separate debugging rounds: once for `Capture thread watchdog channel 8`, once for main.c's
+`disconnected_sampling_entry`. Both times the failure message read "the device never logged it",
+which is indistinguishable from a real firmware defect.
+
+```python
+# Wrong -- the reply to cmd() eats the boot log.
+dev.cmd("kernel reboot cold", timeout=3.0)
+boot = dev.await_line(pattern, 30.0)
+
+# Right -- one continuous read that starts before the reset takes effect.
+boot = dev.await_line(pattern, 30.0, command="kernel reboot cold")
+```
+
+`reboot()` in the harness does this. Any new test that needs boot output should use it rather than
+rolling its own.
+
+### Host Python is typed
+
+Every function in the survey host tooling and test harnesses carries parameter and return
+annotations — `scripts/survey_console.py`, `scripts/survey_decode.py`, `scripts/survey_fixture.py`,
+`tests/host/`, `tests/hardware/`. Annotate as you write, not in a cleanup pass. Structured returns
+use `NamedTuple` rather than positional tuples, so a caller reading `counters(dev).suppressed` cannot
+silently pick the wrong field when one is added.
+
+The upstream scripts (`inspect_state.py`, `smf_to_plantuml.py`, `nrf91_flasher.py`, and the rest) are
+deliberately left alone — retyping them is divergence for no benefit.
+
+### Ask the device how long to wait, do not hardcode it
+
+`run_capture()` waited 420 s, which was the worst case for the step timeouts at the time it was
+written. Raising `APP_SURVEY_CAPTURE_GNSS_TIMEOUT_SECONDS` silently made the harness abandon cycles
+that were still inside their own budget, and the failure reads as "the device stopped responding" —
+the most misleading message it could produce, because the device was working.
+
+`survey capture` prints `Expect up to N s` from `SURVEY_CAPTURE_WORST_CASE_SECONDS`, which is derived
+from the same Kconfig values the orchestrator obeys. The harness now parses that line and waits for
+it plus a fixed slack for the store, so a timeout change cannot desynchronise the two. Prefer this
+shape wherever the firmware already knows a bound: a constant duplicated into a test is a constant
+that will be wrong.
+
 ## Before committing
 
-1. Both builds pass (survey overlay **and** default).
+1. All three builds pass (survey overlay, default, and — if the change touches anything `survey fill`
+   or another default-off option compiles — the fill build).
 2. Unit tests pass, and any new test appears in the per-test output.
 3. Behaviour verified on target — every commit must be flashable and working, not merely compiling.
+   `tests/hardware/survey_hwtest.py --radio` is the floor; add a case there for whatever the commit
+   changed.
 4. A senior-firmware-engineer review of the changeset in a separate context.
 
 ### Check Kconfig claims against the generated `.config`, not against upstream defaults

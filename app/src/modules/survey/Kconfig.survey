@@ -86,6 +86,141 @@ config APP_SURVEY_SHELL_FILL
 
 	    west build ... -- -DCONFIG_APP_SURVEY_SHELL_FILL=y
 
+config APP_SURVEY_CAPTURE
+	bool "Capture orchestrator (GNSS, scan, GNSS)"
+	depends on APP_SURVEY_STORAGE && APP_LOCATION_SCAN_TRIGGER
+	depends on APP_SURVEY_SHELL
+	select LOCATION_DATA_DETAILS
+	default y
+	help
+	  Runs the three location requests of one capture as a sequence on a
+	  dedicated thread, and stores the result as a single record carrying both
+	  GNSS fixes, the scan between them, and the offsets that relate them.
+
+	  The sequencing is a hardware constraint, not a preference: the nRF9151
+	  has one RF front end and cannot run GNSS and LTE at once, and the
+	  Location library stops at the first method that succeeds, so a single
+	  request listing GNSS and the radios returns a fix and never scans.
+
+	  Enabling this makes the orchestrator the only thing that starts a
+	  search. See APP_SURVEY_CAPTURE_OWNS_SEARCH.
+
+	  Depends on APP_SURVEY_SHELL only because "survey capture" is currently
+	  the sole caller. Without the shell, and with OWNS_SEARCH suppressing the
+	  application's own sampling, the build is legal, silent and records
+	  nothing forever. FW-7's cadence timer (CP10) adds the second caller;
+	  drop this dependency then, not before.
+
+	  Selects LOCATION_DATA_DETAILS because the orchestrator sequences on the
+	  Location library's started event: it is what tells a step that the search
+	  it just asked for is the one now running, so a search that finishes
+	  belongs to it and not to something else. Without it the library never
+	  reports started, and every step would wait its full timeout and then its
+	  wind-down instead -- correct, but many minutes per cycle, and silent.
+
+config APP_SURVEY_CAPTURE_OWNS_SEARCH
+	bool "Suppress the application's own periodic location sampling"
+	depends on APP_SURVEY_CAPTURE
+	default y
+	help
+	  Makes the location module ignore LOCATION_SEARCH_TRIGGER, which is what
+	  main.c publishes on its sampling timer and once at startup.
+
+	  Two drivers cannot share the Location library. A trigger that arrives
+	  while a search is running is discarded, so whichever one loses the race
+	  simply does not happen -- and the capture cycle that loses a step
+	  attributes the other driver's radio work to its own timestamps. The
+	  startup sample is the worst case: it is GNSS-first and can hold the
+	  library for the whole CONFIG_LOCATION_REQUEST_DEFAULT_GNSS_TIMEOUT,
+	  which is 600 s by default.
+
+	  Disable to get the upstream sampling behaviour back for comparison.
+
+	  Expect the comparison build to be slower per cycle, not just noisier. A
+	  capture step whose trigger loses the race never sees the library's
+	  started event, so it waits out APP_SURVEY_CAPTURE_IDLE_TIMEOUT_SECONDS
+	  and logs "did not report done" before moving on. That is the intended
+	  handling of a step that does not own its search; it is not a fault.
+
+config APP_SURVEY_CAPTURE_THREAD_STACK_SIZE
+	int "Capture thread stack size"
+	range 1024 16384
+	depends on APP_SURVEY_CAPTURE
+	default 4096
+	help
+	  The cycle keeps its observation snapshot, its record and its trigger
+	  message in static buffers rather than on this stack -- each is around a
+	  kilobyte.
+
+	  What is left is not small. zbus_chan_pub() runs the whole listener
+	  chain synchronously on the publisher's stack, so triggering a step
+	  executes survey.c's callback and survey_obs_update() here, on top of
+	  this thread's own frames and any deferred logging.
+
+	  Matches the value tests/module/survey_capture builds with, so the only
+	  automated exercise of this code runs at the size that ships.
+
+config APP_SURVEY_CAPTURE_WATCHDOG_TIMEOUT_SECONDS
+	int "Capture thread watchdog timeout"
+	range 1 3600
+	depends on APP_SURVEY_CAPTURE
+	default 300
+	help
+	  The capture thread feeds the task watchdog before each step, so this
+	  only has to outlast the longest single step -- a GNSS timeout plus its
+	  wind-down wait -- not a whole cycle. A build assert enforces that.
+
+	  It exists for one failure: the record store publishes with K_FOREVER,
+	  so a storage thread that stops consuming blocks the capture thread
+	  forever, and the admission slot it holds is never returned. Surveying
+	  would then stop permanently, reporting only "a capture is already
+	  running". On a device collecting unattended for a week, a reset is a
+	  far better outcome than a silent stop.
+
+config APP_SURVEY_CAPTURE_GNSS_TIMEOUT_SECONDS
+	int "Give up on one GNSS step after this long"
+	range 1 600
+	depends on APP_SURVEY_CAPTURE
+	default 180
+	help
+	  Bounds one bracketing fix, not the search: nothing is cancelled when it
+	  expires, because a cancel cannot stop a Wi-Fi scan and leaves the next
+	  request returning -EBUSY. The cycle waits for the library to finish on
+	  its own and records the step as failed.
+
+	  Shorter than LOCATION_REQUEST_DEFAULT_GNSS_TIMEOUT on purpose: a cycle
+	  that spends ten minutes failing to see the sky produces one record;
+	  three that spend three minutes each produce three, and the radio
+	  observations are what the survey is for.
+
+	  location.c applies this value to the library's own per-request GNSS
+	  timeout for the survey's triggers, so the two cannot disagree. They
+	  must not: a step that gives up at 180 s while the library searches on
+	  until 600 s leaves the modem busy, and the cycle's next two triggers
+	  are then discarded -- three steps reported, nothing stored, and the
+	  modem still busy when the next cycle starts.
+
+config APP_SURVEY_CAPTURE_SCAN_TIMEOUT_SECONDS
+	int "Give up on the scan step after this long"
+	range 1 600
+	depends on APP_SURVEY_CAPTURE
+	default 60
+	help
+	  Measured Wi-Fi plus cellular scans complete in about 5-10 s. This is
+	  generous by design; it exists to stop a wedged modem from stalling the
+	  cycle forever, not to bound normal operation.
+
+config APP_SURVEY_CAPTURE_IDLE_TIMEOUT_SECONDS
+	int "Wait this long for a finished search to wind down"
+	range 1 600
+	depends on APP_SURVEY_CAPTURE
+	default 30
+	help
+	  The Location library publishes its result before it reports the search
+	  done, and a trigger sent in that gap is discarded. Each step waits here
+	  for the done event before the next trigger, which is what makes the
+	  sequence real rather than hopeful.
+
 module = APP_SURVEY
 module-str = Survey
 source "subsys/logging/Kconfig.template.log_config"

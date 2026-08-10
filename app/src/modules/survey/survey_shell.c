@@ -23,7 +23,11 @@
 
 #include "app_common.h"
 #include "location.h"
+#include "location_trigger_stats.h"
 #include "survey.h"
+#if defined(CONFIG_APP_SURVEY_CAPTURE)
+#include "survey_capture.h"
+#endif
 #include "survey_obs.h"
 #include "survey_record.h"
 #if defined(CONFIG_APP_SURVEY_STORAGE)
@@ -77,6 +81,21 @@ static int trigger_publish(const struct shell *sh, enum location_msg_type type, 
 	struct location_msg msg = { .type = type };
 	int err;
 
+#if defined(CONFIG_APP_SURVEY_CAPTURE)
+	/* Refused rather than raced. Issued in the gap between two capture steps, this
+	 * trigger wins the Location library, the capture's next trigger is discarded, and
+	 * the capture then files *this* command's result under its own timestamps. The
+	 * record that results is well formed and wrong, which is precisely what the
+	 * orchestrator exists to prevent -- so it must not be one keystroke away.
+	 */
+	if (survey_capture_busy()) {
+		shell_warn(sh, "A capture cycle is running; it owns the radio. "
+			       "Wait for \"Cycle N stored\", or run \"survey timing\".");
+
+		return -EBUSY;
+	}
+#endif
+
 	err = zbus_chan_pub(&location_chan, &msg, PUB_TIMEOUT);
 	if (err) {
 		shell_error(sh, "Failed to request %s: %d", what, err);
@@ -113,11 +132,24 @@ static int cmd_survey_gnss(const struct shell *sh, size_t argc, char **argv)
 
 static int cmd_survey_show(const struct shell *sh, size_t argc, char **argv)
 {
+	struct location_trigger_stats triggers;
+
 	ARG_UNUSED(argc);
 	ARG_UNUSED(argv);
 
 	survey_obs_snapshot(&scratch.obs);
 	survey_obs_format(&scratch.obs, shell_line_print, (void *)sh);
+
+	/* Printed here rather than in survey_obs.c, which is kept free of anything but the
+	 * observation cache so it can be unit tested with no fakes.
+	 *
+	 * This line is what lets a test off-device tell its own trigger from a background
+	 * one: the observation counters above advance for any location result whatever, so
+	 * they cannot. See location_trigger_stats.h.
+	 */
+	location_trigger_stats_get(&triggers);
+	shell_line_print((void *)sh, "Triggers: accepted %u, dropped %u, suppressed %u",
+			 triggers.accepted, triggers.dropped, triggers.suppressed);
 
 	return 0;
 }
@@ -313,19 +345,26 @@ static int cmd_survey_hex(const struct shell *sh, size_t argc, char **argv)
 }
 
 #if defined(CONFIG_APP_SURVEY_STORAGE)
-/* "survey store" -- encode the cached observation and commit it to flash.
- *
- * The sequence number restarts at zero every boot. It orders records within one run and
- * nothing more; the capture orchestrator owns session identity.
- */
-static uint32_t store_sequence;
-
+/* "survey store" -- encode the cached observation and commit it to flash. */
 static int cmd_survey_store(const struct shell *sh, size_t argc, char **argv)
 {
+	uint32_t sequence;
 	int err;
 
 	ARG_UNUSED(argc);
 	ARG_UNUSED(argv);
+
+	/* Refused mid-cycle for the same reason "survey capture" refuses: the orchestrator
+	 * is filling the observation cache one step at a time, so a snapshot taken now is
+	 * half a capture -- and once on flash it is indistinguishable from a real one.
+	 */
+#if defined(CONFIG_APP_SURVEY_CAPTURE)
+	if (survey_capture_busy()) {
+		shell_warn(sh, "A capture cycle is running; its record would be mixed with "
+			       "this one. Try again when \"survey timing\" reports it.");
+		return -EBUSY;
+	}
+#endif
 
 	survey_obs_snapshot(&scratch.obs);
 
@@ -339,17 +378,21 @@ static int cmd_survey_store(const struct shell *sh, size_t argc, char **argv)
 		shell_warn(sh, "Cache holds synthetic data: storing a NON-measurement.");
 	}
 
-	err = survey_store_publish(&scratch.obs, store_sequence);
+	/* Drawn from survey_store rather than from a counter here: the capture orchestrator
+	 * also writes records, and two counters both starting at zero produced two records
+	 * claiming the same sequence in one boot.
+	 */
+	sequence = survey_store_next_sequence();
+
+	err = survey_store_publish(&scratch.obs, sequence);
 	if (err) {
 		shell_error(sh, "Store failed (%d).", err);
 		return err;
 	}
 
-	shell_print(sh, "Record %u handed to storage.", store_sequence);
+	shell_print(sh, "Record %u handed to storage.", sequence);
 	shell_print(sh, "Storage writes asynchronously; \"att_storage stats\" reports what "
 			"landed.");
-
-	store_sequence++;
 
 	return 0;
 }
@@ -457,13 +500,17 @@ static int cmd_survey_fill(const struct shell *sh, size_t argc, char **argv)
 		inject_synthetic();
 		survey_obs_snapshot(&scratch.obs);
 
-		err = survey_store_publish(&scratch.obs, store_sequence);
+		/* Same single source as every other writer. A bench fill sharing the sequence
+		 * space with real captures is the point: a host decoder that de-duplicates on
+		 * the field must not see a synthetic record and a measured one claiming the
+		 * same number.
+		 */
+		err = survey_store_publish(&scratch.obs, survey_store_next_sequence());
 		if (err) {
 			shell_error(sh, "Store failed after %u records (%d).", stored, err);
 			break;
 		}
 
-		store_sequence++;
 		stored++;
 
 		/* Not after the last record: the trailing sleep would land in the wall-clock
@@ -490,6 +537,87 @@ static int cmd_survey_fill(const struct shell *sh, size_t argc, char **argv)
 }
 #endif /* CONFIG_APP_SURVEY_SHELL_FILL */
 #endif /* CONFIG_APP_SURVEY_STORAGE */
+
+#if defined(CONFIG_APP_SURVEY_CAPTURE)
+static int cmd_survey_capture(const struct shell *sh, size_t argc, char **argv)
+{
+	enum survey_profile profile = SURVEY_PROFILE_FAST;
+	int err;
+
+	if (argc == 2) {
+		if (strcmp(argv[1], "deep") == 0) {
+			profile = SURVEY_PROFILE_DEEP;
+		} else if (strcmp(argv[1], "fast") != 0) {
+			shell_error(sh, "Unknown profile \"%s\"; expected fast or deep", argv[1]);
+
+			return -EINVAL;
+		}
+	}
+
+	err = survey_capture_request(profile);
+	if (err == -EALREADY) {
+		shell_warn(sh, "A capture is already running; not queued.");
+
+		return 0;
+	} else if (err) {
+		shell_error(sh, "Could not start a capture: %d", err);
+
+		return err;
+	}
+
+	/* Deliberately not "done": the cycle takes as long as GNSS does, and reporting
+	 * success here for work that has not happened is how a bench session ends up
+	 * reading a stale "survey show" as the result of this command.
+	 */
+	shell_print(sh, "Capture started (profile %s). It runs GNSS, then a radio scan, "
+			"then GNSS again.", profile == SURVEY_PROFILE_DEEP ? "deep" : "fast");
+	/* Every step can spend its own timeout waiting for a result and then the idle
+	 * timeout waiting for the search to wind down, so the wind-down is part of the
+	 * bound, not a rounding error. Understating it here is what makes an operator (or a
+	 * test) give up on a device that is merely indoors.
+	 */
+	shell_print(sh, "Expect up to %d s. Watch for \"Cycle N stored\"; then \"survey timing\".",
+		    SURVEY_CAPTURE_WORST_CASE_SECONDS);
+
+	return 0;
+}
+
+static int cmd_survey_timing(const struct shell *sh, size_t argc, char **argv)
+{
+	struct survey_capture_timing timing;
+
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	survey_capture_timing_get(&timing);
+
+	if (!timing.valid) {
+		shell_print(sh, "No capture has completed yet.%s",
+			    survey_capture_busy() ? " One is running now." : "");
+
+		return 0;
+	}
+
+	shell_print(sh, "Capture cycle %u%s", timing.sequence,
+		    survey_capture_busy() ? " (another is running now)" : "");
+	shell_print(sh, "  gnss_before %d ms (%s)", timing.gnss_before_ms,
+		    timing.gnss_before_ok ? "fix" : "no fix");
+	shell_print(sh, "  scan        %d ms (%s)", timing.scan_ms,
+		    timing.scan_ok ? "observations" : "none");
+	shell_print(sh, "  gnss_after  %d ms (%s)", timing.gnss_after_ms,
+		    timing.gnss_after_ok ? "fix" : "no fix");
+	shell_print(sh, "  store       %d ms", timing.store_ms);
+	shell_print(sh, "  total       %d ms", timing.total_ms);
+	/* The four durations above are disjoint but do not tile the total; this is how much
+	 * of the gap is legitimate. Printed rather than left for the reader to derive, so a
+	 * cross-check can bound the unmeasured remainder without recomputing the firmware's
+	 * timeout arithmetic somewhere it would not be updated alongside it.
+	 */
+	shell_print(sh, "  wind_down budget %d ms", (int)SURVEY_CAPTURE_WIND_DOWN_BUDGET_MS);
+
+	return 0;
+}
+#endif /* CONFIG_APP_SURVEY_CAPTURE */
 
 /* SHELL_CMD_ARG with zero optional arguments, so that a mistyped "survey show 3" reports
  * an error instead of silently ignoring the argument.
@@ -519,6 +647,14 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_survey,
 		      "(default 250; no interval is safe unpaced -- see docs)",
 		      cmd_survey_fill, 2, 1),
 #endif
+#endif
+#if defined(CONFIG_APP_SURVEY_CAPTURE)
+	SHELL_CMD_ARG(capture, NULL,
+		      "Run one capture cycle: GNSS, radio scan, GNSS. [fast|deep]",
+		      cmd_survey_capture, 1, 1),
+	SHELL_CMD_ARG(timing, NULL,
+		      "Print how long the last capture cycle's steps took",
+		      cmd_survey_timing, 1, 0),
 #endif
 	SHELL_SUBCMD_SET_END
 );

@@ -19,6 +19,23 @@
 #include "modem/lte_lc.h"
 #include "location.h"
 #include "location_helper.h"
+#if defined(CONFIG_APP_SURVEY)
+/* Guarded so that a build without the survey leaves this upstream-owned file's include
+ * block byte-identical, and every rebase conflict here is one the survey actually caused.
+ */
+#include "location_trigger_stats.h"
+#endif
+#if defined(CONFIG_APP_SURVEY_CAPTURE)
+#include "survey_capture.h"
+#else
+/* The suppression branch below is guarded with IS_ENABLED(), which is dead code rather
+ * than absent code, so the symbol still has to resolve in a build without the survey.
+ */
+static inline bool survey_capture_radio_busy(void)
+{
+	return false;
+}
+#endif
 
 LOG_MODULE_REGISTER(location_module, CONFIG_APP_LOCATION_LOG_LEVEL);
 
@@ -187,6 +204,96 @@ static void location_wdt_callback(int channel_id, void *user_data)
  */
 static bool scan_only_request;
 
+#if defined(CONFIG_APP_SURVEY)
+/* Trigger dispositions. Incremented only from the module thread; read from anywhere, so
+ * atomics rather than plain counters. See location_trigger_stats.h for why a positive
+ * acceptance token has to exist at all.
+ *
+ * Behind CONFIG_APP_SURVEY so that a build without the survey is byte-identical to
+ * upstream here. The three increments below are IF_ENABLED for the same reason: the
+ * maintainer rebases this file on upstream, and every unconditional line is rebase surface.
+ */
+static atomic_t triggers_accepted;
+static atomic_t triggers_dropped;
+static atomic_t triggers_suppressed;
+
+void location_trigger_stats_get(struct location_trigger_stats *out)
+{
+	if (out == NULL) {
+		return;
+	}
+
+	out->accepted = (uint32_t)atomic_get(&triggers_accepted);
+	out->dropped = (uint32_t)atomic_get(&triggers_dropped);
+	out->suppressed = (uint32_t)atomic_get(&triggers_suppressed);
+}
+#endif /* CONFIG_APP_SURVEY */
+
+/* Bound the Location library to the same window the survey's capture step waits for.
+ *
+ * Without this the two disagree and the disagreement cascades: the step gives up at
+ * APP_SURVEY_CAPTURE_GNSS_TIMEOUT_SECONDS while the library keeps searching until
+ * LOCATION_REQUEST_DEFAULT_GNSS_TIMEOUT (600 s in the survey overlay), so the next two
+ * triggers of the cycle land while a search is still active and are discarded. The cycle
+ * then reports three steps, stores nothing, and leaves the modem busy into the next cycle.
+ *
+ * The library's own doc asks for the overall request timeout to be "one minute or more
+ * larger than the sum of method-specific timeouts", which is what the margin is.
+ */
+#if defined(CONFIG_APP_SURVEY_CAPTURE)
+#define SURVEY_REQUEST_MARGIN_MS (60 * MSEC_PER_SEC)
+
+static void survey_timeouts_apply(struct location_config *config, int32_t step_timeout_ms)
+{
+	/* Divided across the methods, not handed to each of them. The caller's budget is
+	 * the one the capture orchestrator will wait out for the whole step; if each method
+	 * got the full amount, a two-method scan could run for twice as long as the step
+	 * that owns it. The orchestrator would then time out, give up waiting for idle, and
+	 * publish step 3's trigger into a radio the library is still using -- that trigger
+	 * is discarded, and the cycle stores a record missing its trailing fix. Dividing
+	 * keeps the two from disagreeing about when the step is over.
+	 */
+	int32_t method_timeout_ms;
+
+	/* location_config_defaults_set() always fills in at least one method, so this is a
+	 * guard against a future caller rather than against today's -- but the failure it
+	 * guards against is a divide-by-zero fault in the location thread, and the cost of
+	 * not dividing is one step running long.
+	 */
+	if (config->methods_count == 0) {
+		LOG_WRN("Location config has no methods; leaving the timeouts alone");
+
+		config->timeout = step_timeout_ms + SURVEY_REQUEST_MARGIN_MS;
+
+		return;
+	}
+
+	method_timeout_ms = step_timeout_ms / config->methods_count;
+
+	for (uint8_t i = 0; i < config->methods_count; i++) {
+		switch (config->methods[i].method) {
+		case LOCATION_METHOD_GNSS:
+			config->methods[i].gnss.timeout = method_timeout_ms;
+			break;
+		case LOCATION_METHOD_CELLULAR:
+			config->methods[i].cellular.timeout = method_timeout_ms;
+			break;
+		case LOCATION_METHOD_WIFI:
+			config->methods[i].wifi.timeout = method_timeout_ms;
+			break;
+		default:
+			break;
+		}
+	}
+
+	/* The library requires the overall timeout to exceed the sum of the per-method ones,
+	 * which is now step_timeout_ms (modulo the division's remainder), so the margin is
+	 * what satisfies that requirement rather than what sets the budget.
+	 */
+	config->timeout = step_timeout_ms + SURVEY_REQUEST_MARGIN_MS;
+}
+#endif /* CONFIG_APP_SURVEY_CAPTURE */
+
 #if defined(CONFIG_LOCATION_METHOD_WIFI) || defined(CONFIG_LOCATION_METHOD_CELLULAR)
 static void cloud_request_send(const struct location_data_cloud *cloud_request)
 {
@@ -335,6 +442,73 @@ static enum smf_state_result state_location_search_inactive_run(void *obj)
 
 		if (location_msg->type == LOCATION_SEARCH_CANCEL) {
 			LOG_DBG("Location search cancel received in inactive state, ignoring");
+		} else if (IS_ENABLED(CONFIG_APP_SURVEY_CAPTURE_OWNS_SEARCH) &&
+			   location_msg->type == LOCATION_SEARCH_TRIGGER) {
+			/* The survey's capture orchestrator is the only thing that may start a
+			 * search. main.c still publishes this on its sampling timer and once at
+			 * startup, and two drivers cannot share the Location library: whichever
+			 * trigger arrives second is discarded, so a capture step that loses the
+			 * race silently attributes the other driver's radio work to its own
+			 * timestamps.
+			 *
+			 * Dropped here rather than by not publishing it, so that the suppression
+			 * is one decision in one place and main.c stays upstream.
+			 */
+			LOG_DBG("Default search trigger ignored; the survey owns the search");
+
+			IF_ENABLED(CONFIG_APP_SURVEY, (atomic_inc(&triggers_suppressed);));
+
+			/* Swallowing the trigger is not enough: LOCATION_SEARCH_DONE is the
+			 * only exit from main.c's two SAMPLING states, so a trigger that
+			 * produces no DONE leaves main in SAMPLING with its sample timer
+			 * already stopped -- no periodic power or environmental samples, and
+			 * nothing in the log, because main feeds its watchdog before waiting
+			 * on zbus rather than after. It recovers only by accident, when a
+			 * capture cycle's own DONE happens along.
+			 *
+			 * Answering immediately is also honest: no search was performed, so a
+			 * search that takes zero time is exactly what happened. Safe to
+			 * publish from here -- this module observes location_chan as a message
+			 * subscriber, so the message is queued rather than delivered under the
+			 * channel lock, and a DONE arriving in this state falls through.
+			 *
+			 * Only while the survey's radio work is in flight, though. A DONE
+			 * published then is indistinguishable from that cycle's own,
+			 * and it is not private to main.c: survey_capture waits on DONE
+			 * alongside each step's data event, so it would end the step early with
+			 * the radio still busy and stamp this step's record with the next one's
+			 * work; and this module's own subscriber FIFO could deliver it after an
+			 * already-queued capture trigger, returning us to INACTIVE mid-search so
+			 * the following trigger is accepted, location_request() answers -EBUSY,
+			 * and SEND_FATAL_ERROR() resets the device. Nothing is lost by staying
+			 * quiet: the cycle's next step publishes a real DONE within seconds,
+			 * and that one releases main just as well.
+			 *
+			 * survey_capture_radio_busy() and not survey_capture_busy(): a cycle
+			 * stays busy through its store, which is tens of seconds once the
+			 * partition fills and which has no more DONEs coming, so suppressing
+			 * across the whole cycle would leave main in SAMPLING with nothing to
+			 * release it -- until some later cycle's DONE happened along, which at
+			 * CP6, where cycles are started by hand, may be never. Answering during
+			 * the store is safe: the last step's real DONE has already put us back
+			 * in this state, and the orchestrator is no longer waiting on one.
+			 *
+			 * Not a lock: a cycle could still begin between this check and the
+			 * publish. That window is microseconds wide against a trigger that
+			 * arrives on a timer measured in minutes, and the flag is raised by the
+			 * requester rather than by the low-priority capture thread, so it does
+			 * not stretch to cover the queueing delay. What makes the survivor
+			 * harmless is that nothing else issues an accepted trigger during a
+			 * cycle: the shell's are refused while busy, main's are suppressed
+			 * here, and the orchestrator waits on DONE before each of its own. That
+			 * is the property to preserve -- a future caller that starts a search
+			 * without checking would break it -- rather than the width of the
+			 * window. Locking across a zbus publish to close it would be the more
+			 * dangerous of the two.
+			 */
+			if (!survey_capture_radio_busy()) {
+				message_send(LOCATION_SEARCH_DONE);
+			}
 		} else if (location_msg->type == LOCATION_SEARCH_TRIGGER) {
 			LOG_DBG("Location search trigger received");
 
@@ -347,6 +521,8 @@ static enum smf_state_result state_location_search_inactive_run(void *obj)
 
 				return SMF_EVENT_HANDLED;
 			}
+
+			IF_ENABLED(CONFIG_APP_SURVEY, (atomic_inc(&triggers_accepted);));
 
 			smf_set_state(SMF_CTX(state_object), &states[STATE_LOCATION_SEARCH_ACTIVE]);
 
@@ -363,6 +539,9 @@ static enum smf_state_result state_location_search_inactive_run(void *obj)
 
 			location_config_defaults_set(&config, 1, methods);
 
+			IF_ENABLED(CONFIG_APP_SURVEY_CAPTURE, (survey_timeouts_apply(&config,
+				CONFIG_APP_SURVEY_CAPTURE_GNSS_TIMEOUT_SECONDS * MSEC_PER_SEC);));
+
 			err = location_request(&config);
 			if (err) {
 				LOG_WRN("location_request, error: %d", err);
@@ -370,6 +549,8 @@ static enum smf_state_result state_location_search_inactive_run(void *obj)
 
 				return SMF_EVENT_HANDLED;
 			}
+
+			IF_ENABLED(CONFIG_APP_SURVEY, (atomic_inc(&triggers_accepted);));
 
 			smf_set_state(SMF_CTX(state_object), &states[STATE_LOCATION_SEARCH_ACTIVE]);
 
@@ -391,6 +572,9 @@ static enum smf_state_result state_location_search_inactive_run(void *obj)
 
 			location_config_defaults_set(&config, ARRAY_SIZE(methods), methods);
 
+			IF_ENABLED(CONFIG_APP_SURVEY_CAPTURE, (survey_timeouts_apply(&config,
+				CONFIG_APP_SURVEY_CAPTURE_SCAN_TIMEOUT_SECONDS * MSEC_PER_SEC);));
+
 			err = location_request(&config);
 			if (err) {
 				LOG_WRN("location_request, error: %d", err);
@@ -398,6 +582,8 @@ static enum smf_state_result state_location_search_inactive_run(void *obj)
 
 				return SMF_EVENT_HANDLED;
 			}
+
+			IF_ENABLED(CONFIG_APP_SURVEY, (atomic_inc(&triggers_accepted);));
 
 			smf_set_state(SMF_CTX(state_object), &states[STATE_LOCATION_SEARCH_ACTIVE]);
 
@@ -433,6 +619,8 @@ static enum smf_state_result state_location_search_active_run(void *obj)
 			 * have no indication and would read a stale result as fresh.
 			 */
 			LOG_WRN("Location trigger received while a search is active, ignoring");
+
+			IF_ENABLED(CONFIG_APP_SURVEY, (atomic_inc(&triggers_dropped);));
 		} else if (location_msg->type == LOCATION_SEARCH_CANCEL) {
 			LOG_DBG("Location search cancel received, cancelling location request");
 

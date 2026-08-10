@@ -42,24 +42,24 @@ from survey_decode import (  # noqa: E402
 FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"
 
 
-def load_fixture(name):
+def load_fixture(name: str) -> bytes:
     return (FIXTURES / f"{name}_v1.cbor").read_bytes()
 
 
-def load_expected(name):
+def load_expected(name: str) -> dict:
     return json.loads((FIXTURES / f"{name}_v1.expected.json").read_text())
 
 
 class TestGoldenFiles(unittest.TestCase):
     """CP4's acceptance: fixture CBOR decodes to the expected JSON, byte for byte."""
 
-    def test_record_matches_golden_json(self):
+    def test_record_matches_golden_json(self) -> None:
         self.assertEqual(decode_record(load_fixture("record")), load_expected("record"))
 
-    def test_session_matches_golden_json(self):
+    def test_session_matches_golden_json(self) -> None:
         self.assertEqual(decode_session(load_fixture("session")), load_expected("session"))
 
-    def test_fixture_is_the_measured_size(self):
+    def test_fixture_is_the_measured_size(self) -> None:
         # FW-5 budgets 700 B. The firmware test asserts this too; repeating it here
         # catches a fixture regenerated from a schema that quietly outgrew the budget.
         self.assertLessEqual(len(load_fixture("record")), 700)
@@ -68,10 +68,10 @@ class TestGoldenFiles(unittest.TestCase):
 class TestRecordValues(unittest.TestCase):
     """Specific values, cross-checked against what the firmware test encoded."""
 
-    def setUp(self):
+    def setUp(self) -> None:
         self.rec = decode_record(load_fixture("record"))
 
-    def test_header_fields(self):
+    def test_header_fields(self) -> None:
         self.assertEqual(self.rec["version"], 1)
         self.assertEqual(self.rec["sequence"], 42)
         self.assertEqual(self.rec["profile"], "DEEP")
@@ -79,30 +79,30 @@ class TestRecordValues(unittest.TestCase):
         self.assertEqual(self.rec["tBase"], 1786140992000)
         self.assertEqual(self.rec["networkMode"], "LTE-M")
 
-    def test_position_survives_at_schema_precision(self):
+    def test_position_survives_at_schema_precision(self) -> None:
         # 1e-7 degrees is ~11 mm, far finer than GNSS accuracy, so the scaled integer
         # must round-trip exactly rather than approximately.
         self.assertAlmostEqual(self.rec["gnssBefore"]["lat"], 37.7712317, places=7)
         self.assertAlmostEqual(self.rec["gnssBefore"]["lon"], -122.4310404, places=7)
         self.assertAlmostEqual(self.rec["gnssBefore"]["acc"], 18.3, places=3)
 
-    def test_negative_longitude_is_not_mangled(self):
+    def test_negative_longitude_is_not_mangled(self) -> None:
         self.assertLess(self.rec["gnssBefore"]["lon"], 0)
 
-    def test_pvt_derived_fields(self):
+    def test_pvt_derived_fields(self) -> None:
         fix = self.rec["gnssBefore"]
         self.assertAlmostEqual(fix["alt"], 25.0, places=3)
         self.assertAlmostEqual(fix["spd"], 31.25, places=3)
         self.assertAlmostEqual(fix["hdg"], 275.5, places=2)
         self.assertEqual(fix["satsUsed"], 6)
 
-    def test_counts_survive(self):
+    def test_counts_survive(self) -> None:
         # One serving cell plus three GCI cells, ten neighbours, ten APs.
         self.assertEqual(len(self.rec["lte"]), 4)
         self.assertEqual(len(self.rec["lte"][0]["nmr"]), 10)
         self.assertEqual(len(self.rec["wifi"]["accessPoints"]), 10)
 
-    def test_serving_cell_identity(self):
+    def test_serving_cell_identity(self) -> None:
         serving = self.rec["lte"][0]
         self.assertEqual(serving["eci"], 21414146)
         self.assertEqual(serving["mcc"], 310)
@@ -110,7 +110,7 @@ class TestRecordValues(unittest.TestCase):
         self.assertEqual(serving["tac"], 14453)
         self.assertEqual(serving["earfcn"], 2300)
 
-    def test_rsrp_and_rsrq_are_converted_from_indices(self):
+    def test_rsrp_and_rsrq_are_converted_from_indices(self) -> None:
         serving = self.rec["lte"][0]
         # Index 54 and 19 are what the modem reported; dBm/dB is what analysis wants.
         # Both are emitted so a suspect conversion can be checked against the raw value.
@@ -119,17 +119,17 @@ class TestRecordValues(unittest.TestCase):
         self.assertEqual(serving["rsrqIndex"], 19)
         self.assertEqual(serving["rsrq"], -10.5)
 
-    def test_mac_is_rendered_from_six_raw_bytes(self):
+    def test_mac_is_rendered_from_six_raw_bytes(self) -> None:
         ap = self.rec["wifi"]["accessPoints"][0]
         self.assertEqual(ap["macAddress"], "94:2a:6f:c4:48:00")
 
-    def test_wifi_frequency_is_derived_not_stored(self):
+    def test_wifi_frequency_is_derived_not_stored(self) -> None:
         ap = self.rec["wifi"]["accessPoints"][0]
         self.assertEqual(ap["channel"], 116)
         self.assertEqual(ap["band"], "5GHz")
         self.assertEqual(ap["frequency"], 5580)
 
-    def test_offsets_survive(self):
+    def test_offsets_survive(self) -> None:
         self.assertEqual(self.rec["offsets"], {
             "cellStartMs": 120,
             "cellEndMs": 4700,
@@ -138,7 +138,7 @@ class TestRecordValues(unittest.TestCase):
             "gnssAfterMs": 6800,
         })
 
-    def test_unmeasured_timing_advance_is_absent_not_zero(self):
+    def test_unmeasured_timing_advance_is_absent_not_zero(self) -> None:
         # This is the assertion the whole "absent, not zero" discipline exists for: the
         # modem reported no timing advance, and 0 is a legitimate reading, so the key
         # must not appear at all.
@@ -149,19 +149,19 @@ class TestRecordValues(unittest.TestCase):
 class TestVersionDispatch(unittest.TestCase):
     """FW-5/HOST-1: fail loudly on an unknown version rather than guessing."""
 
-    def test_unknown_record_version_is_refused(self):
+    def test_unknown_record_version_is_refused(self) -> None:
         # Version 99 with an otherwise well-formed body.
         blob = bytes.fromhex("bf" "0118 63" "0201" "0300" "0400" "0500" "ff".replace(" ", ""))
         with self.assertRaises(ValueError) as ctx:
             decode_record(blob)
         self.assertIn("unsupported record schema version", str(ctx.exception))
 
-    def test_unknown_session_version_is_refused(self):
+    def test_unknown_session_version_is_refused(self) -> None:
         blob = bytes.fromhex("bf" "011863" "026161" "036161" "046161" "ff")
         with self.assertRaises(ValueError):
             decode_session(blob)
 
-    def test_missing_version_is_refused(self):
+    def test_missing_version_is_refused(self) -> None:
         with self.assertRaises(ValueError):
             decode_record(bytes.fromhex("bf0201ff"))
 
@@ -169,43 +169,43 @@ class TestVersionDispatch(unittest.TestCase):
 class TestCborReader(unittest.TestCase):
     """The reader only needs the schema's subset, but must be strict about the rest."""
 
-    def test_indefinite_map(self):
+    def test_indefinite_map(self) -> None:
         # zcbor writes every map this way: 0xBF ... 0xFF with no count.
         self.assertEqual(cbor_decode_one(bytes.fromhex("bf01020304ff")), {1: 2, 3: 4})
 
-    def test_map_with_a_dangling_key_is_an_error(self):
+    def test_map_with_a_dangling_key_is_an_error(self) -> None:
         # A break where a value belongs means the record was cut mid-pair.
         with self.assertRaises(CborError):
             cbor_decode_one(bytes.fromhex("bf010203ff"))
 
-    def test_definite_map(self):
+    def test_definite_map(self) -> None:
         self.assertEqual(cbor_decode_one(bytes.fromhex("a201020304")), {1: 2, 3: 4})
 
-    def test_indefinite_array(self):
+    def test_indefinite_array(self) -> None:
         self.assertEqual(cbor_decode_one(bytes.fromhex("9f010203ff")), [1, 2, 3])
 
-    def test_definite_array(self):
+    def test_definite_array(self) -> None:
         self.assertEqual(cbor_decode_one(bytes.fromhex("83010203")), [1, 2, 3])
 
-    def test_negative_integers(self):
+    def test_negative_integers(self) -> None:
         self.assertEqual(cbor_decode_one(bytes.fromhex("20")), -1)
         self.assertEqual(cbor_decode_one(bytes.fromhex("3a48f97e83")), -1224310404)
 
-    def test_byte_and_text_strings(self):
+    def test_byte_and_text_strings(self) -> None:
         self.assertEqual(cbor_decode_one(bytes.fromhex("46942a6fc44800")),
                          bytes.fromhex("942a6fc44800"))
         self.assertEqual(cbor_decode_one(bytes.fromhex("65312e352e34")), "1.5.4")
 
-    def test_truncated_input_is_an_error(self):
+    def test_truncated_input_is_an_error(self) -> None:
         with self.assertRaises(CborError):
             cbor_decode_one(bytes.fromhex("bf0102"))
 
-    def test_trailing_bytes_are_an_error(self):
+    def test_trailing_bytes_are_an_error(self) -> None:
         # Silently ignoring trailing bytes would hide a framing bug at CP8.
         with self.assertRaises(CborError):
             cbor_decode_one(bytes.fromhex("01" "02"))
 
-    def test_unterminated_indefinite_array_is_an_error(self):
+    def test_unterminated_indefinite_array_is_an_error(self) -> None:
         with self.assertRaises(CborError):
             cbor_decode_one(bytes.fromhex("9f0102"))
 
@@ -213,32 +213,32 @@ class TestCborReader(unittest.TestCase):
 class TestConversions(unittest.TestCase):
     """These mirror survey_obs.c; a divergence here silently corrupts every dataset."""
 
-    def test_rsrp_index_to_dbm(self):
+    def test_rsrp_index_to_dbm(self) -> None:
         self.assertEqual(rsrp_idx_to_dbm(0), -141)
         self.assertEqual(rsrp_idx_to_dbm(55), -86)
         self.assertEqual(rsrp_idx_to_dbm(-1), -141)
 
-    def test_rsrq_index_to_db(self):
+    def test_rsrq_index_to_db(self) -> None:
         self.assertEqual(rsrq_idx_to_db(30), -5.0)
         self.assertEqual(rsrq_idx_to_db(34), -3.0)
         self.assertEqual(rsrq_idx_to_db(35), -3.0)
         self.assertEqual(rsrq_idx_to_db(-1), -20.0)
 
-    def test_wifi_frequency_2_4_ghz(self):
+    def test_wifi_frequency_2_4_ghz(self) -> None:
         self.assertEqual(wifi_frequency_mhz(0, 1), 2412)
         self.assertEqual(wifi_frequency_mhz(0, 6), 2437)
         self.assertEqual(wifi_frequency_mhz(0, 11), 2462)
         self.assertEqual(wifi_frequency_mhz(0, 14), 2484)
 
-    def test_wifi_frequency_5_ghz(self):
+    def test_wifi_frequency_5_ghz(self) -> None:
         self.assertEqual(wifi_frequency_mhz(1, 36), 5180)
         self.assertEqual(wifi_frequency_mhz(1, 116), 5580)
 
-    def test_wifi_frequency_6_ghz(self):
+    def test_wifi_frequency_6_ghz(self) -> None:
         self.assertEqual(wifi_frequency_mhz(2, 2), 5935)
         self.assertEqual(wifi_frequency_mhz(2, 1), 5955)
 
-    def test_out_of_range_pair_yields_no_frequency(self):
+    def test_out_of_range_pair_yields_no_frequency(self) -> None:
         # Fabricating a frequency here would put a plausible wrong number into analysis.
         self.assertIsNone(wifi_frequency_mhz(0, 99))
         self.assertIsNone(wifi_frequency_mhz(1, 5))
@@ -246,7 +246,7 @@ class TestConversions(unittest.TestCase):
 
 
 class TestInterpolation(unittest.TestCase):
-    def test_midpoint_lies_between_the_brackets(self):
+    def test_midpoint_lies_between_the_brackets(self) -> None:
         rec = interpolate(decode_record(load_fixture("record")))
         interp = rec["interpolated"]
         before = rec["gnssBefore"]["lat"]
@@ -256,13 +256,13 @@ class TestInterpolation(unittest.TestCase):
         # Scan spans 120..4700 ms, so the midpoint is 2410 ms.
         self.assertEqual(interp["atMs"], 2410.0)
 
-    def test_raw_brackets_are_retained(self):
+    def test_raw_brackets_are_retained(self) -> None:
         # HOST-1 is explicit: the interpolated value never replaces the measurements.
         rec = interpolate(decode_record(load_fixture("record")))
         self.assertIn("gnssBefore", rec)
         self.assertIn("gnssAfter", rec)
 
-    def test_uncertainty_grows_with_speed(self):
+    def test_uncertainty_grows_with_speed(self) -> None:
         rec = decode_record(load_fixture("record"))
         rec["gnssBefore"]["spd"] = rec["gnssAfter"]["spd"] = 1.0
         slow = interpolate(dict(rec))["interpolated"]["interp_uncertainty_m"]
@@ -270,43 +270,43 @@ class TestInterpolation(unittest.TestCase):
         fast = interpolate(dict(rec))["interpolated"]["interp_uncertainty_m"]
         self.assertAlmostEqual(fast, slow * 10.0, places=6)
 
-    def test_missing_bracket_is_not_interpolated(self):
+    def test_missing_bracket_is_not_interpolated(self) -> None:
         rec = decode_record(load_fixture("record"))
         del rec["gnssAfter"]
         self.assertNotIn("interpolated", interpolate(rec))
 
-    def test_missing_scan_window_is_not_interpolated(self):
+    def test_missing_scan_window_is_not_interpolated(self) -> None:
         rec = decode_record(load_fixture("record"))
         del rec["offsets"]
         self.assertNotIn("interpolated", interpolate(rec))
 
 
 class TestQualityGate(unittest.TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         self.rec = interpolate(decode_record(load_fixture("record")))
 
-    def test_clean_record_passes(self):
+    def test_clean_record_passes(self) -> None:
         gate = Gate(max_acc_m=100.0, max_interp_uncertainty_m=1000.0)
         self.assertEqual(gate.reasons(self.rec), [])
 
-    def test_uptime_timebase_is_flagged(self):
+    def test_uptime_timebase_is_flagged(self) -> None:
         self.rec["timeBase"] = "uptime"
         self.assertIn("uptime_timebase", Gate().reasons(self.rec))
 
-    def test_uptime_can_be_allowed(self):
+    def test_uptime_can_be_allowed(self) -> None:
         self.rec["timeBase"] = "uptime"
         gate = Gate(allow_uptime=True, max_interp_uncertainty_m=1000.0)
         self.assertEqual(gate.reasons(self.rec), [])
 
-    def test_missing_bracket_is_flagged(self):
+    def test_missing_bracket_is_flagged(self) -> None:
         del self.rec["gnssAfter"]
         self.assertIn("missing_bracket", Gate().reasons(self.rec))
 
-    def test_poor_accuracy_is_flagged(self):
+    def test_poor_accuracy_is_flagged(self) -> None:
         self.rec["gnssBefore"]["acc"] = 250.0
         self.assertIn("poor_gnss_accuracy", Gate().reasons(self.rec))
 
-    def test_excessive_interpolation_uncertainty_is_flagged(self):
+    def test_excessive_interpolation_uncertainty_is_flagged(self) -> None:
         gate = Gate(max_interp_uncertainty_m=1.0)
         self.assertIn("excessive_interp_uncertainty", gate.reasons(self.rec))
 
@@ -314,7 +314,7 @@ class TestQualityGate(unittest.TestCase):
 class TestHexCapture(unittest.TestCase):
     """Reads what "survey hex" prints on the console, unedited."""
 
-    def test_extracts_a_block_from_surrounding_noise(self):
+    def test_extracts_a_block_from_surrounding_noise(self) -> None:
         blob = load_fixture("record")
         capture = (
             "uart:~$ survey hex\r\n"
@@ -329,11 +329,11 @@ class TestHexCapture(unittest.TestCase):
         self.assertEqual(found[0], blob)
         self.assertEqual(decode_record(found[0])["sequence"], 42)
 
-    def test_capture_without_a_block_is_an_error(self):
+    def test_capture_without_a_block_is_an_error(self) -> None:
         with self.assertRaises(ValueError):
             records_from_hex_capture("uart:~$ survey show\r\nnothing here\r\n")
 
-    def test_truncated_capture_raises_rather_than_returning_garbage(self):
+    def test_truncated_capture_raises_rather_than_returning_garbage(self) -> None:
         # The normal field failure: the terminal dropped bytes mid-dump. Half a record
         # decoded as if whole would be worse than no record.
         blob = load_fixture("record")
@@ -349,16 +349,16 @@ class TestHexCapture(unittest.TestCase):
 class TestMalformedInput(unittest.TestCase):
     """A corrupted capture must produce a reportable error, never a traceback."""
 
-    def test_top_level_non_map_is_a_cbor_error(self):
+    def test_top_level_non_map_is_a_cbor_error(self) -> None:
         # 0x01 is a bare integer: valid CBOR, not a record.
         with self.assertRaises(CborError):
             decode_record(b"\x01")
 
-    def test_top_level_array_is_a_cbor_error(self):
+    def test_top_level_array_is_a_cbor_error(self) -> None:
         with self.assertRaises(CborError):
             decode_record(bytes([0x9F, 0x01, 0xFF]))
 
-    def test_session_rejects_a_non_map_too(self):
+    def test_session_rejects_a_non_map_too(self) -> None:
         with self.assertRaises(CborError):
             decode_session(b"\x01")
 
@@ -371,15 +371,15 @@ class TestSignedSignalIndices(unittest.TestCase):
     record. The firmware round-trip test covers the encode side; this covers the decode.
     """
 
-    def test_negative_rsrp_converts(self):
+    def test_negative_rsrp_converts(self) -> None:
         # Bottom of the range. Mirrors RSRP_IDX_TO_DBM, which is idx - 140.
         self.assertEqual(rsrp_idx_to_dbm(-17), -157)
 
-    def test_negative_rsrq_converts(self):
+    def test_negative_rsrq_converts(self) -> None:
         # Bottom of the range. Mirrors RSRQ_IDX_TO_DB, which is idx/2 - 19.5.
         self.assertEqual(rsrq_idx_to_db(-30), -34.5)
 
-    def test_negative_index_survives_a_decode(self):
+    def test_negative_index_survives_a_decode(self) -> None:
         raw = {
             1: 1, 2: 1, 3: 0, 4: 2, 5: 1786140992000,
             13: {1: 21414146, 2: 310, 3: 260, 4: 14453, 6: -17, 7: -30},
@@ -390,7 +390,7 @@ class TestSignedSignalIndices(unittest.TestCase):
 
 
 class TestAbsentFields(unittest.TestCase):
-    def test_absent_time_diff_is_omitted_not_zero(self):
+    def test_absent_time_diff_is_omitted_not_zero(self) -> None:
         # LTE_LC_CELL_TIME_DIFF_INVALID is 0, so the firmware omits the key entirely. A
         # decoder that defaulted it to 0 would report perfect alignment for a neighbour
         # the modem could not align at all.
@@ -401,7 +401,7 @@ class TestAbsentFields(unittest.TestCase):
         nmr = decode_record(raw)["lte"][0]["nmr"][0]
         self.assertNotIn("timeDiff", nmr)
 
-    def test_present_time_diff_is_kept(self):
+    def test_present_time_diff_is_kept(self) -> None:
         raw = {
             1: 1, 2: 1, 3: 0, 4: 2, 5: 1786140992000,
             14: [{1: 101, 2: 650, 3: 60, 4: 21, 5: 32}],
@@ -411,7 +411,7 @@ class TestAbsentFields(unittest.TestCase):
 
 
 class TestInterpolationEdges(unittest.TestCase):
-    def test_zero_bracket_gap_is_not_interpolated(self):
+    def test_zero_bracket_gap_is_not_interpolated(self) -> None:
         # Both fixes at the same instant. Dividing by it would raise; treating it as
         # "absent" would hide a real inconsistency in the record.
         rec = decode_record(load_fixture("record"))
@@ -420,14 +420,14 @@ class TestInterpolationEdges(unittest.TestCase):
         self.assertNotIn("interpolated", out)
         self.assertEqual(out["interp_skipped"], "non_positive_bracket_gap")
 
-    def test_negative_bracket_gap_is_not_extrapolated_backwards(self):
+    def test_negative_bracket_gap_is_not_extrapolated_backwards(self) -> None:
         rec = decode_record(load_fixture("record"))
         rec["offsets"]["gnssAfterMs"] = -500
         self.assertNotIn("interpolated", interpolate(rec))
 
 
 class TestGateReasonNaming(unittest.TestCase):
-    def test_unset_timebase_is_named_for_what_it_is(self):
+    def test_unset_timebase_is_named_for_what_it_is(self) -> None:
         # "unset" means nothing ever timestamped the cycle -- a different fault from a
         # clock that ran unsynchronised, and the drop report should say which.
         rec = interpolate(decode_record(load_fixture("record")))

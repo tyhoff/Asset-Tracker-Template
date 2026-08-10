@@ -34,6 +34,11 @@ import argparse
 import json
 import re
 import sys
+from typing import Any, Optional, Sequence, Union
+
+# One decoded CBOR item. Recursive in principle; spelled one level deep because a
+# fully recursive alias buys nothing a reader of this decoder does not already know.
+CborValue = Union[None, bool, int, float, str, bytes, list, dict]
 
 # The only schema this decoder understands. Bumping the on-device SURVEY_RECORD_VERSION
 # without teaching the decoder the new layout must fail loudly, not silently mis-parse.
@@ -61,8 +66,22 @@ class CborError(ValueError):
 _INDEFINITE = object()
 _BREAK = object()
 
+# The argument is a count or a value for every head except those two sentinels, which is
+# why this is a union and not an int: annotating it `int` would have told a reader that
+# `for _ in range(arg)` is always safe, and the indefinite-length branches exist because it
+# is not.
+_HeadArg = Union[int, object]
 
-def _read_head(data, pos):
+
+def _want_int(arg: _HeadArg, pos: int) -> int:
+    """Narrow a head argument to its integer form, or say why it is not one."""
+    if not isinstance(arg, int):
+        raise CborError(f"indefinite-length argument where a count was required at "
+                        f"offset {pos}")
+    return arg
+
+
+def _read_head(data: bytes, pos: int) -> tuple[int, _HeadArg, int]:
     """Return (major_type, argument, new_pos)."""
     if pos >= len(data):
         raise CborError(f"truncated at offset {pos}")
@@ -91,17 +110,24 @@ def _read_head(data, pos):
     raise CborError(f"unsupported additional-information {minor} at offset {pos - 1}")
 
 
-def _at_break(data, pos):
+def _at_break(data: bytes, pos: int) -> bool:
     """True when the next item is a break code. Does not consume it."""
     return pos < len(data) and data[pos] == 0xFF
 
 
-def _cbor_load(data, pos=0):
+def _cbor_load(data: bytes, pos: int = 0) -> tuple[CborValue, int]:
     """Decode one CBOR item. Returns (value, new_pos)."""
     major, arg, pos = _read_head(data, pos)
 
     if arg is _BREAK:
         raise CborError(f"unexpected break code at offset {pos - 1}")
+
+    if major in (0, 1, 2, 3):
+        # _read_head returns a sentinel argument only for majors 4, 5 and 7, so this
+        # cannot fire -- it is what makes the arithmetic below legible to a checker.
+        # Raised rather than asserted because `python -O` drops asserts, and the
+        # alternative there is a TypeError from inside the decoder's arithmetic.
+        arg = _want_int(arg, pos)
 
     if major == 0:
         return arg, pos
@@ -123,6 +149,7 @@ def _cbor_load(data, pos=0):
                 raise CborError("unterminated indefinite-length array")
             pos += 1
         else:
+            arg = _want_int(arg, pos)
             for _ in range(arg):
                 item, pos = _cbor_load(data, pos)
                 out.append(item)
@@ -138,6 +165,7 @@ def _cbor_load(data, pos=0):
                 raise CborError("unterminated indefinite-length map")
             pos += 1
         else:
+            arg = _want_int(arg, pos)
             for _ in range(arg):
                 key, pos = _cbor_load(data, pos)
                 value, pos = _cbor_load(data, pos)
@@ -147,9 +175,15 @@ def _cbor_load(data, pos=0):
     raise CborError(f"unsupported major type {major} at offset {pos - 1}")
 
 
-def cbor_decode_one(data):
-    """Decode exactly one CBOR item, rejecting trailing bytes."""
-    value, pos = _cbor_load(data, 0)
+def cbor_decode_one(data: Union[bytes, bytearray]) -> CborValue:
+    """Decode exactly one CBOR item, rejecting trailing bytes.
+
+    A bytearray is accepted and copied once here rather than threaded through the loader:
+    the callers that hold one are assembling a record from console output, and every byte
+    string this returns should be immutable and hashable regardless of what it was sliced
+    from.
+    """
+    value, pos = _cbor_load(bytes(data), 0)
     if pos != len(data):
         raise CborError(f"{len(data) - pos} trailing byte(s) after the CBOR item")
     return value
@@ -161,12 +195,12 @@ def cbor_decode_one(data):
 # small and lossless; the conversion to dBm/dB belongs on this side.
 
 
-def rsrp_idx_to_dbm(idx):
+def rsrp_idx_to_dbm(idx: int) -> int:
     """3GPP RSRP index to dBm. Mirrors SURVEY_RSRP_IDX_TO_DBM in survey_obs.c."""
     return idx - 140 if idx < 0 else idx - 141
 
 
-def rsrq_idx_to_db(idx):
+def rsrq_idx_to_db(idx: int) -> float:
     """3GPP RSRQ index to dB. Mirrors survey_rsrq_idx_to_db in survey_obs.c."""
     if idx < 0:
         return (idx - 39) * 0.5
@@ -187,7 +221,7 @@ WIFI_BAND_NAMES = {
 }
 
 
-def wifi_frequency_mhz(band, channel):
+def wifi_frequency_mhz(band: int, channel: int) -> Optional[int]:
     """Channel plus band to centre frequency, or None if the pair is not valid.
 
     Mirrors wifi_frequency_mhz in survey_obs.c. Frequency is derived rather than stored
@@ -216,7 +250,7 @@ NETWORK_MODE_NAMES = {0: "unknown", 1: "LTE-M", 2: "NB-IoT"}
 # --- Record decoding ----------------------------------------------------------------------
 
 
-def _decode_gnss_fix(raw):
+def _decode_gnss_fix(raw: dict) -> dict[str, Any]:
     """A gnss-fix map to ground-fix position names, rescaled from stored integers."""
     fix = {
         "lat": raw[1] / 1e7,
@@ -236,7 +270,7 @@ def _decode_gnss_fix(raw):
     return fix
 
 
-def _decode_cell(raw):
+def _decode_cell(raw: dict) -> dict[str, Any]:
     """An identified cell (serving or GCI) to ground-fix lte[] names."""
     cell = {
         "eci": raw[1],
@@ -257,7 +291,7 @@ def _decode_cell(raw):
     return cell
 
 
-def _decode_neighbour(raw):
+def _decode_neighbour(raw: dict) -> dict[str, Any]:
     """A neighbour measurement to ground-fix nmr[] names."""
     nbr = {"pci": raw[1]}
     if 2 in raw:
@@ -273,7 +307,7 @@ def _decode_neighbour(raw):
     return nbr
 
 
-def _decode_access_point(raw):
+def _decode_access_point(raw: dict) -> dict[str, Any]:
     """An access point to ground-fix wifi.accessPoints[] names."""
     mac = raw[1]
     ap = {
@@ -293,7 +327,7 @@ def _decode_access_point(raw):
     return ap
 
 
-def decode_session(data):
+def decode_session(data: Union[bytes, bytearray, dict]) -> dict[str, Any]:
     """Decode a session header. Raises ValueError on an unknown version."""
     raw = cbor_decode_one(data) if isinstance(data, (bytes, bytearray)) else data
 
@@ -318,7 +352,7 @@ def decode_session(data):
     return session
 
 
-def decode_record(data):
+def decode_record(data: Union[bytes, bytearray, dict]) -> dict[str, Any]:
     """Decode one record. Raises ValueError on an unknown version."""
     raw = cbor_decode_one(data) if isinstance(data, (bytes, bytearray)) else data
 
@@ -383,7 +417,7 @@ def decode_record(data):
 # --- Ground-truth interpolation -----------------------------------------------------------
 
 
-def scan_window(rec):
+def scan_window(rec: dict[str, Any]) -> Optional[tuple[int, int]]:
     """Return (start_ms, end_ms) of the radio scan relative to tBase, or None.
 
     The window spans both legs: Wi-Fi runs on the nRF7002 and overlaps the cellular
@@ -397,7 +431,7 @@ def scan_window(rec):
     return min(starts), max(ends)
 
 
-def interpolate(rec):
+def interpolate(rec: dict[str, Any]) -> dict[str, Any]:
     """Attach an interpolated ground-truth position at the scan midpoint.
 
     Sets rec["interpolated"] with lat/lon and interp_uncertainty_m, or leaves the record
@@ -458,16 +492,16 @@ def interpolate(rec):
 class Gate:
     """Configurable quality gate. Never silent: every decision is counted and reported."""
 
-    def __init__(self, max_acc_m=100.0, max_interp_uncertainty_m=50.0,
-                 require_bracket=True, allow_uptime=False):
+    def __init__(self, max_acc_m: float = 100.0, max_interp_uncertainty_m: float = 50.0,
+                 require_bracket: bool = True, allow_uptime: bool = False) -> None:
         self.max_acc_m = max_acc_m
         self.max_interp_uncertainty_m = max_interp_uncertainty_m
         self.require_bracket = require_bracket
         self.allow_uptime = allow_uptime
 
-    def reasons(self, rec):
+    def reasons(self, rec: dict[str, Any]) -> list[str]:
         """Return the list of reasons this record fails the gate. Empty means it passes."""
-        out = []
+        out: list[str] = []
 
         # An uptime-based record cannot be correlated with anything off-device, so it can
         # never be scored against ground truth however good its fix was.
@@ -506,7 +540,7 @@ _HEX_BLOCK = re.compile(
 )
 
 
-def records_from_hex_capture(text):
+def records_from_hex_capture(text: str) -> list[bytes]:
     """Extract records from a console capture containing "survey hex" output.
 
     Matches the delimiters cmd_survey_hex prints, so a terminal log can be fed in
@@ -523,7 +557,7 @@ def records_from_hex_capture(text):
     return out
 
 
-def main(argv=None):
+def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Decode radio-survey CBOR records into JSON Lines.",
     )
