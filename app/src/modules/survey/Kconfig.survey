@@ -259,6 +259,22 @@ config APP_SURVEY_CAPTURE_IDLE_TIMEOUT_SECONDS
 	  for the done event before the next trigger, which is what makes the
 	  sequence real rather than hopeful.
 
+config APP_SURVEY_EXPORT
+	bool "Restrict MCUmgr fs_mgmt to read-only access under /att_storage"
+	depends on APP_SURVEY_STORAGE
+	depends on MCUMGR_GRP_FS_FILE_ACCESS_HOOK
+	default y if MCUMGR_GRP_FS_FILE_ACCESS_HOOK
+	help
+	  Registers a fs_mgmt file-access callback that denies every access type except a
+	  read, and denies reads outside /att_storage. Without it, fs_mgmt's own access
+	  hook is unregistered and "fs upload" can write any path -- including the header
+	  files that both the storage backend and the boot-time sequence recovery in
+	  survey_store.c trust without validating.
+
+	  Default y whenever the hook Kconfig is available, because an export build with
+	  the transport enabled and this left off is a build that shipped the
+	  vulnerability the hook exists to close.
+
 module = APP_SURVEY
 module-str = Survey
 source "subsys/logging/Kconfig.template.log_config"

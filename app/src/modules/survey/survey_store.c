@@ -9,9 +9,12 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/zbus/zbus.h>
+#include <zephyr/fs/fs.h>
 
 #include "survey_obs.h"
 #include "survey_record.h"
+#include "survey_record_decode.h"
+#include "survey_record_types.h"
 #include "survey_store.h"
 
 #if defined(CONFIG_APP_SURVEY_LOG_LEVEL)
@@ -169,8 +172,147 @@ static int stage_and_publish(const struct survey_record_data *record, uint32_t s
  */
 static atomic_t sequence_next;
 
+/* Guards the one-time recovery below, not the counter itself -- atomic_inc() needs no lock.
+ * A separate mutex from staging_lock on purpose: next_sequence() is called before
+ * stage_and_publish() takes staging_lock in the shell path, and conflating the two would
+ * make the lock ordering a thing to reason about instead of a thing that is obviously fine.
+ */
+static K_MUTEX_DEFINE(sequence_recovery_lock);
+static bool sequence_recovered;
+
+/* Duplicates the LittleFS backend's record-locating arithmetic (littlefs_backend.c:
+ * get_entries_per_block(), get_file_index(), get_entry_offset_index(), and the header
+ * layout) rather than extending that backend with an indexed-read primitive it does not
+ * have. That backend is upstream-owned; this file is not.
+ *
+ * The duplication is safe specifically because it is fail-closed, not because it is
+ * guaranteed to match: any drift between this arithmetic and the real backend -- a path
+ * that does not exist, a seek past what was written, a slot that does not decode -- just
+ * falls through to "start at 0", which is the behaviour a corrupted or unreadable last
+ * record is supposed to get anyway. A mismatch here is never a silently wrong sequence
+ * number, only an unnecessarily conservative one.
+ */
+static uint32_t recover_last_sequence(void)
+{
+	struct fs_file_t file;
+	struct {
+		uint32_t read_offset;
+		uint32_t write_offset;
+	} header;
+	struct fs_statvfs stat;
+	char path[sizeof("/att_storage/SURVEY_4294967295.bin")];
+	size_t entries_per_block;
+	uint32_t wrapped_index;
+	uint32_t file_index;
+	uint32_t entry_offset_index;
+	static struct survey_store_msg slot;
+	static struct survey_record decoded;
+	size_t decoded_len;
+	int ret;
+
+	fs_file_t_init(&file);
+
+	ret = fs_open(&file, "/att_storage/SURVEY.header", FS_O_READ);
+	if (ret < 0) {
+		STORE_WRN("Sequence recovery: no header (%d); starting a new sequence at 0", ret);
+
+		return 0;
+	}
+
+	ret = (int)fs_read(&file, &header, sizeof(header));
+	fs_close(&file);
+
+	if (ret != (int)sizeof(header)) {
+		STORE_WRN("Sequence recovery: short header read (%d); starting a new sequence "
+			  "at 0", ret);
+
+		return 0;
+	}
+
+	if (header.write_offset == header.read_offset) {
+		/* No records survived, whether because none were ever stored or because
+		 * everything was retrieved and cleared. Either way there is nothing to
+		 * recover from and 0 is the right answer, not a fallback.
+		 */
+		return 0;
+	}
+
+	ret = fs_statvfs("/att_storage", &stat);
+	if (ret < 0 || stat.f_frsize == 0) {
+		STORE_WRN("Sequence recovery: fs_statvfs failed (%d); starting a new sequence "
+			  "at 0", ret);
+
+		return 0;
+	}
+
+	entries_per_block = stat.f_frsize / SURVEY_STORE_SLOT_SIZE;
+	if (entries_per_block == 0) {
+		STORE_WRN("Sequence recovery: slot size exceeds block size; starting a new "
+			  "sequence at 0");
+
+		return 0;
+	}
+
+	wrapped_index = (header.write_offset - 1) % CONFIG_APP_STORAGE_MAX_RECORDS_PER_TYPE;
+	file_index = wrapped_index / entries_per_block;
+	entry_offset_index = wrapped_index % entries_per_block;
+
+	ret = snprintk(path, sizeof(path), "/att_storage/SURVEY_%u.bin", file_index);
+	if (ret < 0 || ret >= (int)sizeof(path)) {
+		STORE_WRN("Sequence recovery: path build failed; starting a new sequence at 0");
+
+		return 0;
+	}
+
+	fs_file_t_init(&file);
+
+	ret = fs_open(&file, path, FS_O_READ);
+	if (ret < 0) {
+		STORE_WRN("Sequence recovery: cannot open %s (%d); starting a new sequence "
+			  "at 0", path, ret);
+
+		return 0;
+	}
+
+	ret = fs_seek(&file, (off_t)(entry_offset_index * SURVEY_STORE_SLOT_SIZE), FS_SEEK_SET);
+	if (ret < 0) {
+		fs_close(&file);
+		STORE_WRN("Sequence recovery: seek into %s failed (%d); starting a new "
+			  "sequence at 0", path, ret);
+
+		return 0;
+	}
+
+	ret = (int)fs_read(&file, &slot, sizeof(slot));
+	fs_close(&file);
+
+	if (ret != (int)sizeof(slot) || slot.len == 0 || slot.len > sizeof(slot.cbor)) {
+		STORE_WRN("Sequence recovery: bad slot read from %s (%d); starting a new "
+			  "sequence at 0", path, ret);
+
+		return 0;
+	}
+
+	ret = cbor_decode_survey_record(slot.cbor, slot.len, &decoded, &decoded_len);
+	if (ret != 0) {
+		STORE_WRN("Sequence recovery: last record does not decode (%d); starting a "
+			  "new sequence at 0", ret);
+
+		return 0;
+	}
+
+	return decoded.sequence_m + 1;
+}
+
 uint32_t survey_store_next_sequence(void)
 {
+	k_mutex_lock(&sequence_recovery_lock, K_FOREVER);
+	if (!sequence_recovered) {
+		atomic_set(&sequence_next, (atomic_val_t)recover_last_sequence());
+		sequence_recovered = true;
+	}
+	k_mutex_unlock(&sequence_recovery_lock);
+
 	return (uint32_t)atomic_inc(&sequence_next);
 }
 

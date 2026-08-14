@@ -1141,6 +1141,25 @@ whichever is easier to find. Same applies to RAM figures — take them from the 
 arithmetic, which is how a 1,536-byte estimate stood in for an actual 1,152 bytes, 768 of it in
 `.noinit` rather than `.bss`.
 
+### A Kconfig whose `depends on` is unmet vanishes without a word
+
+Setting `CONFIG_MCUMGR_TRANSPORT_UART=y` in an overlay does nothing on its own: the symbol
+`depends on UART_MCUMGR`, a console-driver option nothing else in this build enables. Kconfig does
+not warn, does not error, and does not mention the assignment it discarded. The build succeeded, the
+devicetree `chosen` override to `&uart1` applied correctly and was visible in `zephyr.dts`, the
+image flashed — and the port simply never answered. Every visible artefact said the transport was
+there.
+
+`select` propagates upward and `depends on` does not, so an overlay that only turns on the leaf
+option gets silence. The rule that follows is the one the section above already states, applied
+before debugging rather than after: **grep the generated `.config` for the symbol you set.** Absent
+means the dependency chain rejected it. Two minutes of `grep -E "^CONFIG_MCUMGR_TRANSPORT"` beat an
+hour of probing a serial port at four baud rates, which is what it cost here.
+
+Worth pairing with: when a config is load-bearing for a transport that only a host can exercise, add
+a `BUILD_ASSERT` on it. `IS_ENABLED(CONFIG_MCUMGR_TRANSPORT_UART)` failing at compile time names the
+problem; a silent port does not.
+
 ## Editor diagnostics
 
 clangd in this tree reports `'zephyr/kernel.h' file not found` and unknown Zephyr types. Those are

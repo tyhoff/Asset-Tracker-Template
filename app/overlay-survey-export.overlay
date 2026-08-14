@@ -1,0 +1,25 @@
+/*
+ * CP8 / FW-8 -- point the raw MCUmgr SMP transport at uart1.
+ *
+ * The board's thingy91x_nrf9151_common.dtsi chooses uart0 for all three of console,
+ * shell-uart and uart-mcumgr. Leaving uart-mcumgr there would put raw SMP frames on the same
+ * wire as the shell, where they would be interleaved with log output and neither would
+ * survive. uart1 is the second UART the nRF5340 connectivity bridge forwards to a CDC ACM
+ * port (see nrf/applications/connectivity_bridge/src/modules/uart_handler.c, which lists
+ * uart0 and uart1, and usb_cdc_handler.c, which lists cdc_acm_uart0 and cdc_acm_uart1), so
+ * this lands SMP on the host's second /dev/cu.usbmodem* with no extra cable.
+ *
+ * uart1 is declared at 1000000 baud by the board and is otherwise unclaimed in this build.
+ * The one thing that does claim it is modem tracing -- app/boards/thingy91x_nrf9151_ns.overlay
+ * chooses uart1 for nordic,modem-trace-uart, and overlay-modem-trace-over-uart.conf turns
+ * that on. The two are mutually exclusive by construction: a build cannot both trace the
+ * modem over uart1 and export over it. The survey image does not enable modem tracing, and
+ * the BUILD_ASSERT in survey_export.c makes the collision a compile error rather than two
+ * drivers quietly fighting over one peripheral.
+ */
+
+/ {
+	chosen {
+		zephyr,uart-mcumgr = &uart1;
+	};
+};
