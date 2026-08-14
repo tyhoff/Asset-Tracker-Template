@@ -82,6 +82,14 @@ struct survey_observation {
 	int64_t scan_timestamp;
 	enum survey_time_base scan_time_base;
 	struct location_cloud_request_data scan;
+
+	/** Access points dropped from @c scan for having a locally-administered BSSID.
+	 *
+	 * Reported so that a scan with few access points can be told apart from a filter
+	 * that is discarding too much. Zero when CONFIG_APP_SURVEY_DROP_LOCAL_MAC is n, and
+	 * refers only to the most recent scan.
+	 */
+	uint16_t scan_local_mac_dropped;
 };
 
 /** @brief printf-style line sink.
@@ -94,6 +102,17 @@ typedef void (*survey_print_fn)(void *ctx, const char *fmt, ...) __printf_like(2
 /** @brief Discard the cached observation and zero the counters. */
 void survey_obs_reset(void);
 
+/** @brief What one scan left in the cache, and what the BSSID filter took out of it. */
+struct survey_obs_scan_counts {
+	/** Access points cached, after filtering and after the wifi_cnt bound. */
+	uint16_t kept;
+	/** Access points removed for having a locally-administered BSSID.
+	 *
+	 * Always zero when CONFIG_APP_SURVEY_DROP_LOCAL_MAC is n.
+	 */
+	uint16_t dropped;
+};
+
 /** @brief Fold a location module message into the cache.
  *
  * Messages other than LOCATION_GNSS_DATA and LOCATION_CLOUD_REQUEST are ignored.
@@ -102,9 +121,22 @@ void survey_obs_reset(void);
  * @param now_ms     Current time, in the base described by @p time_base. Used to stamp
  *                   scans, which the location module leaves unstamped.
  * @param time_base  Which clock @p now_ms and @c msg->timestamp are against.
+ *
+ * @return The cached and dropped access point counts for this scan. Both zero for any
+ *         message that is not a scan.
+ *
+ * Returned rather than read back through an accessor, and both counts rather than just
+ * the dropped one. The cache is not private to @c location_chan -- @c survey clear and
+ * @c survey selftest reach it from the shell thread, outside the channel mutex that
+ * serialises publishers -- so a second look could see a different scan, or none, and
+ * subtracting one snapshot's count from another's can go negative. Returning @c kept as
+ * well means the caller needs no arithmetic at all: it cannot derive a surviving count
+ * from @c msg->cloud_request.wifi_cnt that disagrees with what was actually stored, which
+ * it otherwise could whenever a message arrives with more access points than the cache's
+ * array holds and the count is clamped to fit.
  */
-void survey_obs_update(const struct location_msg *msg, int64_t now_ms,
-		       enum survey_time_base time_base);
+struct survey_obs_scan_counts survey_obs_update(const struct location_msg *msg, int64_t now_ms,
+						enum survey_time_base time_base);
 
 /** @brief Mark the cached observation as injected test data.
  *

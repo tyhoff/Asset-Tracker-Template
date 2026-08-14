@@ -411,6 +411,22 @@ def decode_record(data: Union[bytes, bytearray, dict]) -> dict[str, Any]:
     if 17 in raw:
         rec["networkMode"] = NETWORK_MODE_NAMES.get(raw[17], f"unknown({raw[17]})")
 
+    # Access points the device filtered out for having a randomised BSSID. Absent means
+    # none were dropped -- or that the record predates the filter, which amounts to the
+    # same thing for the reader. Nested under wifi[] rather than promoted to the top
+    # level because it describes the AP list and is meaningless without it; a record with
+    # no wifi[] at all still gets the key when the device dropped every AP it saw, which
+    # is precisely the case worth being able to see.
+    #
+    # accessPoints is defaulted alongside it so that "wifi" in rec keeps implying
+    # rec["wifi"]["accessPoints"], as it did when key 16 was the only thing that created
+    # the dict. A consumer iterating rec["wifi"]["accessPoints"] would otherwise raise
+    # KeyError on exactly the drop-everything record, the one it most wants to look at.
+    if 18 in raw:
+        wifi = rec.setdefault("wifi", {})
+        wifi.setdefault("accessPoints", [])
+        wifi["apDropped"] = raw[18]
+
     return rec
 
 

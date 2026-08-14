@@ -222,6 +222,11 @@ static void fake_work_fn(struct k_work *work)
 				cache.scan_valid = true;
 				cache.scan_timestamp = k_uptime_get();
 				cache.scan.wifi_cnt = 3;
+				/* Non-zero so that the orchestrator failing to carry it
+				 * into the record is a failure rather than a match against
+				 * the zero-initialised field.
+				 */
+				cache.scan_local_mac_dropped = 2;
 				publish(LOCATION_CLOUD_REQUEST);
 			} else {
 				cache.gnss_valid = true;
@@ -605,6 +610,15 @@ void test_stored_record_brackets_the_scan_with_two_fixes(void)
 	TEST_ASSERT_TRUE(stored_record.gnss_before_valid);
 	TEST_ASSERT_TRUE(stored_record.scan_valid);
 	TEST_ASSERT_TRUE(stored_record.gnss_after_valid);
+
+	/* The dropped-AP count has to survive the snapshot into the record. It is one
+	 * assignment in survey_capture.c and nothing else asserted it: deleting that line
+	 * left every suite green while every record written in the field silently lost the
+	 * field, and the loss is invisible in the export -- absent means "nothing was
+	 * dropped", which is exactly what a missing assignment looks like.
+	 */
+	TEST_ASSERT_EQUAL_UINT16_MESSAGE(2, stored_record.scan_local_mac_dropped,
+					 "the dropped-AP count did not reach the record");
 }
 
 void test_all_offsets_are_populated_and_ordered(void)

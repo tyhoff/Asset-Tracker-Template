@@ -318,7 +318,7 @@ class TestHexCapture(unittest.TestCase):
         blob = load_fixture("record")
         capture = (
             "uart:~$ survey hex\r\n"
-            "survey record: 583 bytes, schema version 1\r\n"
+            f"survey record: {len(blob)} bytes, schema version 1\r\n"
             "-----BEGIN SURVEY RECORD-----\r\n"
             + "\r\n".join(blob.hex()[i:i + 64] for i in range(0, len(blob.hex()), 64))
             + "\r\n-----END SURVEY RECORD-----\r\n"
@@ -408,6 +408,53 @@ class TestAbsentFields(unittest.TestCase):
         }
         nmr = decode_record(raw)["lte"][0]["nmr"][0]
         self.assertEqual(nmr["timeDiff"], 32)
+
+
+class TestDroppedApCount(unittest.TestCase):
+    """Key 18 records how many APs the BSSID filter removed before the scan was stored.
+
+    It matters downstream because the filter is destructive: the unfiltered scan exists
+    only for the lifetime of one zbus callback. Without this count a train carriage where
+    two thirds of the APs were phone hotspots and a quiet lab where none were look
+    identical in the dataset, and the AP density of the survey is unexplainable.
+    """
+
+    def test_count_decodes_from_the_fixture(self) -> None:
+        self.assertEqual(decode_record(load_fixture("record"))["wifi"]["apDropped"], 7)
+
+    def test_absent_key_omits_it_rather_than_reporting_zero(self) -> None:
+        # The key is optional and was added after the first records were captured, so
+        # absent means "unknown" -- for a pre-filter record it is not the same claim as
+        # "nothing was dropped", and reporting 0 would fabricate the difference away.
+        raw = {
+            1: 1, 2: 1, 3: 0, 4: 2, 5: 1786140992000,
+            16: [{1: bytes.fromhex("942a6fc44800"), 2: -40, 3: 1, 4: 116}],
+        }
+        self.assertNotIn("apDropped", decode_record(raw)["wifi"])
+
+    def test_count_survives_without_any_surviving_ap(self) -> None:
+        # Every AP in range was randomised. The scan list is empty but the record still
+        # has to say the radio saw something, otherwise it reads as "no Wi-Fi coverage".
+        raw = {1: 1, 2: 1, 3: 0, 4: 2, 5: 1786140992000, 18: 4}
+        self.assertEqual(decode_record(raw)["wifi"]["apDropped"], 4)
+
+    def test_wifi_always_carries_an_ap_list_even_when_all_were_dropped(self) -> None:
+        # Before key 18 existed, key 16 was the only thing that created wifi[], so
+        # "wifi" in rec implied rec["wifi"]["accessPoints"]. A consumer that iterates
+        # the list would otherwise raise KeyError on precisely the drop-everything
+        # record, which is the one it most wants to look at.
+        raw = {1: 1, 2: 1, 3: 0, 4: 2, 5: 1786140992000, 18: 4}
+        self.assertEqual(decode_record(raw)["wifi"]["accessPoints"], [])
+
+    def test_a_present_ap_list_is_not_replaced_by_the_default(self) -> None:
+        raw = {
+            1: 1, 2: 1, 3: 0, 4: 2, 5: 1786140992000,
+            16: [{1: bytes.fromhex("942a6fc44800"), 2: -40, 3: 1, 4: 116}],
+            18: 4,
+        }
+        wifi = decode_record(raw)["wifi"]
+        self.assertEqual(len(wifi["accessPoints"]), 1)
+        self.assertEqual(wifi["apDropped"], 4)
 
 
 class TestInterpolationEdges(unittest.TestCase):

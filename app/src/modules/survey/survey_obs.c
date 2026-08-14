@@ -102,11 +102,117 @@ void survey_obs_reset(void)
 	k_mutex_unlock(&obs_lock);
 }
 
-void survey_obs_update(const struct location_msg *msg, int64_t now_ms,
-		       enum survey_time_base time_base)
+/* Bit 1 of the first octet of a MAC address: set means locally administered rather than
+ * assigned from an OUI. IEEE 802 calls it the U/L bit.
+ */
+#define MAC_LOCALLY_ADMINISTERED BIT(1)
+
+/* Drop access points whose BSSID is locally administered, compacting the array in place.
+ * Returns the surviving and removed counts.
+ *
+ * These are randomised BSSIDs -- phone and laptop hotspots, and Wi-Fi Direct and CarPlay
+ * links, which re-randomise per session. They are not stable, so they cannot be resolved
+ * to a position by any positioning service, and the survey exists to be checked against
+ * one. Keeping them costs record space and puts measurements into the dataset that no
+ * consumer can do anything with. A survey taken in a train carriage or a car park is
+ * mostly them.
+ *
+ * What this does NOT do is recover access points that were crowded out. The Location
+ * library caps its result set at CONFIG_LOCATION_METHOD_WIFI_SCANNING_RESULTS_MAX_CNT (10
+ * on this board) before it publishes, and location_helper.c rejects anything longer with
+ * -ENOMEM rather than truncating, so by the time a scan reaches this cache the real access
+ * points that the randomised ones displaced are already gone. The measured 4-in-10 spent 4
+ * of those 10 upstream slots. Recovering them means raising that cap and
+ * CONFIG_APP_LOCATION_WIFI_APS_MAX with it, which is a separate change with its own
+ * heap and record-size consequences -- filtering here cannot substitute for it.
+ *
+ * Filtered here, where every scan lands, rather than in the encoder: the console commands
+ * read this same cache, so filtering at encode time would leave "survey show" listing
+ * access points that are not in the stored record, which is the kind of disagreement that
+ * costs a bench session to work out.
+ *
+ * Only the U/L bit. The multicast bit (bit 0) would make the address malformed as a BSSID
+ * rather than merely unstable, and nothing has been seen to report one; leaving it alone
+ * keeps this function about one well-defined thing.
+ */
+static struct survey_obs_scan_counts drop_local_mac_aps(struct location_cloud_request_data *scan)
 {
+	/* Clamped rather than trusted. Every producer in the tree already bounds this
+	 * (location_helper.c rejects an over-long count with -ENOMEM, cloud_location.c
+	 * validates), so an out-of-range wifi_cnt is unreachable today -- but this is the
+	 * only place in the module that *writes* based on the count, and the two writes
+	 * below would run off the end of a fixed array inside a static struct. A read that
+	 * overruns prints nonsense; a write that overruns corrupts the neighbouring fields.
+	 *
+	 * No cast on ARRAY_SIZE: narrowing it to uint16_t to match the operand types would
+	 * evaluate to 0 for an array longer than 65535 and silently discard every access
+	 * point. Widening wifi_cnt instead makes the comparison safe at any array size, and
+	 * the result is provably <= wifi_cnt, so the narrowing on assignment cannot lose.
+	 */
+	const uint16_t count = (uint16_t)MIN((size_t)scan->wifi_cnt, ARRAY_SIZE(scan->wifi_aps));
+	uint16_t kept = 0;
+	uint16_t dropped = 0;
+
+	/* Applied before the filter can decline to run, so the bound holds in both
+	 * configurations. A clamp that exists only when DROP_LOCAL_MAC=y would be worse than
+	 * no clamp at all: format_scan() reads up to wifi_cnt in either build, and a safety
+	 * property that silently depends on an unrelated Kconfig is one nobody will check.
+	 */
+	scan->wifi_cnt = count;
+
+	if (!IS_ENABLED(CONFIG_APP_SURVEY_DROP_LOCAL_MAC)) {
+		return (struct survey_obs_scan_counts){ .kept = count, .dropped = 0 };
+	}
+
+	for (uint16_t i = 0; i < count; i++) {
+		if (scan->wifi_aps[i].mac[0] & MAC_LOCALLY_ADMINISTERED) {
+			dropped++;
+			continue;
+		}
+
+		/* Self-assignment when nothing has been dropped yet, which is the common
+		 * case and is cheaper than branching around it.
+		 */
+		scan->wifi_aps[kept] = scan->wifi_aps[i];
+		kept++;
+	}
+
+	/* Zeroed rather than left behind the new count. Nothing should read past wifi_cnt,
+	 * but a stale BSSID sitting in the tail of a cached structure is exactly the sort
+	 * of thing that reappears in a hex dump and takes an afternoon to explain.
+	 *
+	 * The length comes from the array, not from the drop count, and the whole remainder
+	 * goes rather than just the gap the compaction opened. That is deliberate: kept is
+	 * bounded by count which is bounded by ARRAY_SIZE, so this expression cannot address
+	 * past the end whatever the counters do, whereas a dropped-derived length can -- and
+	 * an overrun here is currently unobservable from outside. Measured from the DWARF for
+	 * this build: wifi_aps is the last member of the scan and ends at offset 958 of
+	 * struct survey_observation, then 2 bytes of padding, then scan_local_mac_dropped at
+	 * 960, then 6 bytes of tail padding to the 968-byte total. A one-entry overrun is 10
+	 * bytes and lands in exactly those 2 + 2 + 6 -- it never leaves the struct, and the
+	 * only live bytes it touches are a counter survey_obs_update() overwrites on the
+	 * following line. So no test sees it and ASAN cannot redzone it either.
+	 *
+	 * That is a coincidence with zero bytes of margin, not a safety property. Append one
+	 * member after scan_local_mac_dropped, or change CONFIG_APP_LOCATION_WIFI_APS_MAX,
+	 * and the same slip becomes a real write past the end of a .bss object. Either way
+	 * the answer is the same: the arithmetic has to not exist.
+	 */
+	memset(&scan->wifi_aps[kept], 0,
+	       (ARRAY_SIZE(scan->wifi_aps) - kept) * sizeof(scan->wifi_aps[0]));
+
+	scan->wifi_cnt = kept;
+
+	return (struct survey_obs_scan_counts){ .kept = kept, .dropped = dropped };
+}
+
+struct survey_obs_scan_counts survey_obs_update(const struct location_msg *msg, int64_t now_ms,
+						enum survey_time_base time_base)
+{
+	struct survey_obs_scan_counts counts = { 0 };
+
 	if (msg == NULL) {
-		return;
+		return counts;
 	}
 
 	k_mutex_lock(&obs_lock, K_FOREVER);
@@ -125,6 +231,8 @@ void survey_obs_update(const struct location_msg *msg, int64_t now_ms,
 		obs.synthetic = false;
 		obs.scan_count++;
 		obs.scan = msg->cloud_request;
+		counts = drop_local_mac_aps(&obs.scan);
+		obs.scan_local_mac_dropped = counts.dropped;
 		/* Stamped on receipt: the location module does not timestamp cloud
 		 * requests. This is an upper bound on the true measurement time.
 		 */
@@ -139,6 +247,8 @@ void survey_obs_update(const struct location_msg *msg, int64_t now_ms,
 	}
 
 	k_mutex_unlock(&obs_lock);
+
+	return counts;
 }
 
 void survey_obs_mark_synthetic(void)
@@ -304,6 +414,15 @@ static void format_scan(const struct survey_observation *o, survey_print_fn prin
 		format_identified_cell(print, ctx, "        ", &o->scan.gci_cells[i]);
 	}
 
+	/* Printed only when something was dropped, so that the common line stays the one
+	 * an operator already knows how to read. Printed at all because "3 access points"
+	 * in a busy place otherwise looks like a broken scan rather than a working filter.
+	 */
+	if (o->scan_local_mac_dropped > 0) {
+		print(ctx, "  wifi: %u locally-administered BSSID(s) dropped (randomised, "
+			   "not resolvable to a position)", o->scan_local_mac_dropped);
+	}
+
 	print(ctx, "  wifi.accessPoints[] %u:", o->scan.wifi_cnt);
 	for (uint16_t i = 0; i < o->scan.wifi_cnt; i++) {
 		const struct location_wifi_ap_info *ap = &o->scan.wifi_aps[i];
@@ -385,6 +504,12 @@ void survey_obs_format_stats(const struct survey_observation *o, int64_t now_ms,
 	format_age(print, ctx, "scan                ", o->scan_valid, o->scan_timestamp, now_ms);
 	print(ctx, "time base           : gnss %s, scan %s", time_base_str(o->gnss_time_base),
 	      time_base_str(o->scan_time_base));
-	print(ctx, "caps                : wifi_aps %d, neighbor_cells %d",
-	      CONFIG_APP_LOCATION_WIFI_APS_MAX, CONFIG_APP_LOCATION_NEIGHBOR_CELLS_MAX);
+	/* The BSSID filter is a compile-time choice, and until it is reported here there is
+	 * no way to ask a flashed device which way it was built. The integration suite needs
+	 * that to decide whether "no randomised BSSID survived" is a requirement or a
+	 * misconfiguration, and an operator comparing two boards needs it more.
+	 */
+	print(ctx, "caps                : wifi_aps %d, neighbor_cells %d, drop_local_mac %s",
+	      CONFIG_APP_LOCATION_WIFI_APS_MAX, CONFIG_APP_LOCATION_NEIGHBOR_CELLS_MAX,
+	      IS_ENABLED(CONFIG_APP_SURVEY_DROP_LOCAL_MAC) ? "y" : "n");
 }

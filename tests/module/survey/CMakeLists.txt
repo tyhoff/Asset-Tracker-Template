@@ -47,3 +47,11 @@ target_compile_definitions(app PRIVATE
   -DCONFIG_LOCATION_METHOD_WIFI=1
   -DCONFIG_LOCATION_METHODS_LIST_SIZE=3
 )
+
+set(SURVEY_DROP_LOCAL_MAC "y" CACHE STRING "Drop locally-administered BSSIDs: y or n")
+
+if(SURVEY_DROP_LOCAL_MAC STREQUAL "y")
+	target_compile_definitions(app PRIVATE -DCONFIG_APP_SURVEY_DROP_LOCAL_MAC=1)
+elseif(NOT SURVEY_DROP_LOCAL_MAC STREQUAL "n")
+	message(FATAL_ERROR "SURVEY_DROP_LOCAL_MAC must be y or n, got '${SURVEY_DROP_LOCAL_MAC}'")
+endif()

@@ -28,6 +28,10 @@
 ;
 ; VERSION HISTORY
 ;   1  Initial schema.
+;      Key 18 (ap-dropped) was added later without a version bump. It is optional, so
+;      records written before it existed decode unchanged -- absent means "this build did
+;      not filter", which is exactly what those records represent. A bump would have
+;      invalidated the partition for no gain.
 
 ; --- Session header ---------------------------------------------------------------------
 ;
@@ -88,6 +92,17 @@ survey-record = {
     ? 15 => [* gci-cell],     ; GCI full-identity cells
     ? 16 => [* access-point], ; wifi.accessPoints[]
     ? 17 => network-mode,
+
+    ; How many access points the BSSID filter removed before the list above was built.
+    ; Omitted when none were, so it costs nothing on a clean scan.
+    ;
+    ; Recorded because the filter is destructive and irreversible: the unfiltered scan
+    ; exists only for the lifetime of one zbus callback. Without this, a train carriage
+    ; where 8 of 10 access points were randomised and an empty lab with 2 are identical on
+    ; the wire, and the evidence to tell them apart was discarded weeks before anyone
+    ; looked at the data. It is also the only way to notice the filter misbehaving after
+    ; the fact.
+    ? 18 => ap-dropped,
 }
 
 ; 0 = FAST, 1 = DEEP.
@@ -104,6 +119,9 @@ time-base = uint .size 1
 
 ; 0 = unknown, 1 = LTE-M, 2 = NB-IoT.
 network-mode = uint .size 1
+
+; Bounded by the modem's scan result count, so one byte on the wire in every real case.
+ap-dropped = uint .size 2
 
 ; --- Components -------------------------------------------------------------------------
 

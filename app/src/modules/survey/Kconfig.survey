@@ -28,6 +28,44 @@ config APP_SURVEY_SHELL
 	  Register the "survey" shell command group, used to inspect captured
 	  observations and to trigger captures manually from a console.
 
+config APP_SURVEY_DROP_LOCAL_MAC
+	bool "Drop access points with a locally-administered BSSID"
+	default y
+	help
+	  Discard Wi-Fi access points whose BSSID has the IEEE 802 U/L bit set
+	  (bit 1 of the first octet) as the scan is cached.
+
+	  These are randomised BSSIDs: phone and laptop hotspots, Wi-Fi Direct
+	  and CarPlay links. They re-randomise per session, so no positioning
+	  service can resolve them to a location, and the whole point of the
+	  survey is to be checked against one.
+
+	  In a train carriage or a car park most of what is in the air is
+	  randomised, so this is the difference between a record that resolves
+	  and one that does not.
+
+	  It does not recover access points that were crowded out. The Location
+	  library caps its result set at
+	  LOCATION_METHOD_WIFI_SCANNING_RESULTS_MAX_CNT (10 on this board) before
+	  it publishes, and rejects a longer set outright rather than truncating,
+	  so by the time a scan reaches the cache the real access points that the
+	  randomised ones displaced are already gone. Recovering those means
+	  raising that limit and APP_LOCATION_WIFI_APS_MAX with it, which is a
+	  separate change with its own heap and record-size cost.
+
+	  Applied where the scan is cached, so "survey show", "survey hex" and
+	  the stored record all agree about what was seen. The count that was
+	  dropped is reported by "survey show", so a genuinely quiet area can be
+	  told apart from a filter discarding too much.
+
+	  That count is also written into the stored record, at CDDL key 18, so
+	  this option changes what goes on flash and not only what the console
+	  prints. Records captured with it disabled carry no count, which on the
+	  wire is indistinguishable from a scan in which nothing was randomised.
+
+	  Disable to see the unfiltered scan on the bench, which is how to check
+	  that claim rather than trust it.
+
 config APP_SURVEY_STORAGE
 	bool "Store survey records on flash"
 	depends on APP_STORAGE_BACKEND_LITTLEFS

@@ -167,7 +167,43 @@ class Device:
                     print(f"    | {line.strip()}")
         return buf
 
-    def wake(self) -> None:
+    def wake(self, settle: float = 1.0, max_wait: float = 20.0) -> None:
+        """Bring the console to a clean prompt, waiting out any boot chatter first.
+
+        Flashing resets the device, so a suite started straight afterwards runs its
+        first test while the banner is still arriving. The reply to "survey" comes back
+        interleaved with littlefs, wifi_nrf_bus and Memfault lines, and the test fails
+        on a build that is perfectly correct -- a false red that looks exactly like the
+        wrong image or the wrong port, which is what its failure message will claim.
+
+        console.drain() does not cover this: its quiet threshold is 0.15 s and its
+        ceiling 1.5 s, while boot output has gaps longer than the former and runs past
+        the latter, so it returns in the middle of the banner. Those constants are right
+        for draining between commands, which is what the interactive console wants, so
+        the longer wait lives here rather than in the shared helper.
+
+        A trailing prompt ends the wait immediately: boot output finishes with one, so
+        the settle timer is only actually needed for the case where the device says
+        nothing at all. It is still the authority -- the prompt can arrive mid-banner
+        from a shell that came up before the last driver logged.
+        """
+        deadline = time.monotonic() + max_wait
+        last_rx = time.monotonic()
+        tail = b""
+
+        while time.monotonic() < deadline:
+            chunk = self.ser.read(max(1, self.ser.in_waiting))
+            if chunk:
+                last_rx = time.monotonic()
+                # A window, not exactly len(PROMPT): the device emits a trailing space
+                # after the prompt, so an exact-width tail never matches it.
+                tail = (tail + chunk)[-32:]
+                continue
+            if (time.monotonic() - last_rx) >= settle or tail.rstrip().endswith(
+                PROMPT.encode()
+            ):
+                break
+
         console.wake_shell(self.ser, PROMPT)
 
 
@@ -511,6 +547,85 @@ def t_scan(dev: "Device") -> None:
     want(neighbors > 0 or aps > 0 or served,
          f"scan completed but returned nothing: {neighbors} neighbours, {aps} APs, "
          "no serving cell -- no network and nothing in range?", show)
+
+
+@test("scan_drops_locally_administered_bssids", tags=(TAG_RADIO, TAG_SLOW))
+def t_scan_drops_local_macs(dev: "Device") -> None:
+    """No randomised BSSID reaches the cache from a real scan.
+
+    Asserted on what survived rather than on what was dropped, because how many phone
+    hotspots are in range is a property of the room and not of the firmware -- an
+    assertion that something *was* dropped would pass in an office and fail in a lab at
+    midnight. The invariant that holds everywhere is that nothing with the U/L bit set is
+    left behind.
+
+    Skipped on a build with the filter off, which the Kconfig help explicitly invites for
+    bench comparison: asserting it there reports a firmware defect against a configuration
+    working exactly as designed. The device states which way it was built on the caps line.
+    """
+    stats = dev.cmd("survey stats", timeout=8.0)
+    if "drop_local_mac y" not in stats:
+        want_in("drop_local_mac", stats,
+                "the device does not report its BSSID filter setting, so this test "
+                "cannot tell a working filter from one that is compiled out")
+        raise Skip("built with CONFIG_APP_SURVEY_DROP_LOCAL_MAC=n")
+
+    dev.cmd("survey clear")
+    scan_log = trigger(dev, "survey scan", "scan", 60.0)
+    show = dev.cmd("survey show", timeout=8.0)
+
+    macs = re.findall(r"macAddress ([0-9A-F]{2}):", show)
+    want(bool(macs) or "wifi.accessPoints[] 0" in show,
+         "neither access points nor an empty AP list in the cached scan", show)
+
+    local = [m for m in macs if int(m, 16) & 0x02]
+    want(not local,
+         f"{len(local)} of {len(macs)} cached BSSID(s) are locally administered "
+         f"(first octets {', '.join(local)}) -- the filter did not run", show)
+
+    # The dropped line is conditional on something having been dropped, so its absence is
+    # not a failure. When it is there, it has to agree with itself: a zero would mean the
+    # render condition and the counter disagree.
+    dropped = re.search(r"(\d+) locally-administered BSSID\(s\) dropped", show)
+    if dropped is not None:
+        want(int(dropped.group(1)) > 0,
+             "the dropped-BSSID line was rendered with a count of zero", show)
+
+    # The "Scan cached:" log line has no unit test behind it -- survey.c is not built by
+    # any native_sim suite -- so this is the only thing standing between it and a silent
+    # regression. Both of its counts are checked against the rendered cache, which catches
+    # the format arguments being swapped, the subtraction being dropped, and the count
+    # being read back from a cache some other command has since changed.
+    #
+    # The comparison is only meaningful if the log line and the render describe the SAME
+    # scan, and on a build with the capture orchestrator running they need not: it samples
+    # on its own cadence, so an older cycle's line can be sitting in trigger()'s buffer
+    # before "survey scan" is even sent, and a newer cycle can land between trigger()
+    # returning and "survey show" being answered. Either way the counts disagree because
+    # the room changed, not because the firmware is wrong -- an intermittent red that
+    # accuses the filter.
+    #
+    # "survey clear" above zeroes the counters and "survey show" prints the serial of what
+    # it rendered, so "scan #1" is an exact statement that one scan has happened since the
+    # clear and this is it. Anything else means a cycle intervened; the U/L assertions
+    # above still stand on their own, so the cross-check is skipped rather than failed.
+    serial = re.search(r"scan #(\d+)\)", show)
+    want(serial is not None, "no scan serial in the survey show header", show)
+    if serial.group(1) != "1":
+        print(f"    [scan #{serial.group(1)} since clear -- an autonomous cycle "
+              f"intervened, skipping the log/render cross-check]")
+        return
+
+    matches = re.findall(r"Scan cached: \d+ neighbor\(s\), \d+ gci, (\d+) AP\(s\) "
+                         r"\((\d+) randomised BSSID\(s\) dropped\)", scan_log)
+    want(bool(matches), "no 'Scan cached' line with an AP and dropped count", scan_log)
+    logged = matches[-1]
+    want(int(logged[0]) == len(macs),
+         f"the log announced {logged[0]} AP(s) but the cache holds {len(macs)}",
+         scan_log + "\n---\n" + show)
+    want(int(logged[1]) == (int(dropped.group(1)) if dropped else 0),
+         f"the log announced {logged[1]} dropped but the cache reports "
+         f"{dropped.group(1) if dropped else 0}", scan_log + "\n---\n" + show)
 
 
 @test("scan_repeats_without_ebusy", tags=(TAG_RADIO, TAG_SLOW))

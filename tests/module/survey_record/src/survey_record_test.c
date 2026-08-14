@@ -70,6 +70,11 @@ static struct survey_record_data full_record(void)
 		.wifi_end = { .valid = true, .ms = 4650 },
 		.gnss_after_at = { .valid = true, .ms = 6800 },
 		.scan_valid = true,
+		/* Non-zero so the maximal record really is maximal: this is the fixture the
+		 * worst-case size assertion is measured against, and an optional field left
+		 * absent here would under-measure the budget by its own width.
+		 */
+		.scan_local_mac_dropped = 7,
 		.network_mode = SURVEY_NETWORK_MODE_LTEM,
 	};
 
@@ -144,6 +149,39 @@ void test_scalar_header_fields_survive_the_round_trip(void)
 	TEST_ASSERT_EQUAL_UINT64(1786140992000, decoded.t_base_m);
 	TEST_ASSERT_TRUE(decoded.network_mode_m_present);
 	TEST_ASSERT_EQUAL_UINT32(SURVEY_NETWORK_MODE_LTEM, decoded.network_mode_m.network_mode_m);
+	TEST_ASSERT_TRUE(decoded.ap_dropped_m_present);
+	TEST_ASSERT_EQUAL_UINT32(7, decoded.ap_dropped_m.ap_dropped_m);
+}
+
+void test_a_scan_that_dropped_nothing_omits_the_dropped_count(void)
+{
+	/* Absent, not zero -- the schema's rule, and here it carries a second meaning: a
+	 * record written by a build with the filter compiled out also dropped nothing, and
+	 * absent describes both honestly. A zero would assert that a filter ran and found
+	 * nothing to remove.
+	 */
+	struct survey_record_data rec = full_record();
+
+	rec.scan_local_mac_dropped = 0;
+
+	round_trip(&rec);
+
+	TEST_ASSERT_FALSE(decoded.ap_dropped_m_present);
+}
+
+void test_the_dropped_count_is_omitted_when_no_scan_was_captured(void)
+{
+	/* A GNSS-only cycle has no AP list, so a count of what was filtered out of it would
+	 * be describing a scan that does not exist in the record.
+	 */
+	struct survey_record_data rec = full_record();
+
+	rec.scan_valid = false;
+	rec.scan_local_mac_dropped = 4;
+
+	round_trip(&rec);
+
+	TEST_ASSERT_FALSE(decoded.ap_dropped_m_present);
 }
 
 void test_position_survives_at_the_precision_the_schema_promises(void)
@@ -480,6 +518,12 @@ void test_from_obs_falls_back_to_the_scan_time_base(void)
 		.scan_valid = true,
 		.scan_time_base = SURVEY_TIME_BASE_UPTIME,
 		.scan_timestamp = 45000,
+		/* Carried all the way to the encoded record here rather than in a test of its
+		 * own: the other encoder tests build survey_record_data directly and so skip
+		 * survey_record_from_obs(), leaving its one assignment of this field with no
+		 * coverage at all. Non-zero so an omission cannot pass as the zero default.
+		 */
+		.scan_local_mac_dropped = 3,
 	};
 
 	obs.scan.wifi_cnt = 1;
@@ -496,6 +540,9 @@ void test_from_obs_falls_back_to_the_scan_time_base(void)
 	TEST_ASSERT_EQUAL_UINT64(45000, decoded.t_base_m);
 	TEST_ASSERT_FALSE(decoded.gnss_fix_before_m_present);
 	TEST_ASSERT_EQUAL_size_t(1, decoded.access_point_m_l.access_point_m_count);
+	TEST_ASSERT_TRUE_MESSAGE(decoded.ap_dropped_m_present,
+				 "survey_record_from_obs() did not carry the dropped-AP count");
+	TEST_ASSERT_EQUAL_UINT32(3, decoded.ap_dropped_m.ap_dropped_m);
 }
 
 void test_session_header_round_trips(void)

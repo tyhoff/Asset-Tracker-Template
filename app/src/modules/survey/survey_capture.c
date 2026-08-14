@@ -429,6 +429,8 @@ static void capture_cycle(enum survey_profile profile, int wdt_id)
 		if (cycle_obs.scan_valid) {
 			cycle_record.scan_valid = true;
 			cycle_record.scan = cycle_obs.scan;
+			cycle_record.scan_local_mac_dropped =
+				cycle_obs.scan_local_mac_dropped;
 			offset_set(&cycle_record.cell_start, t_base_ms, scan.started_at_ms);
 			offset_set(&cycle_record.wifi_start, t_base_ms, scan.started_at_ms);
 			offset_set(&cycle_record.cell_end, t_base_ms, scan.ended_at_ms);

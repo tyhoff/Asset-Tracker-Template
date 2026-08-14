@@ -1,5 +1,19 @@
+# Built once per setting of the BSSID filter. It is a compile-time choice in the real build
+# too, so testing one of them would leave the other unbuilt as well as unasserted -- and the
+# "off" setting exists precisely to be reached for on a bench, which is the worst moment to
+# discover it does not compile. Same reasoning as survey_store's .stop/.overwrite pair.
 tests:
-  asset_tracker_template.fw.survey:
+  asset_tracker_template.fw.survey.drop_local_mac:
+    extra_args:
+      - SURVEY_DROP_LOCAL_MAC=y
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    integration_platforms:
+      - native_sim
+  asset_tracker_template.fw.survey.keep_local_mac:
+    extra_args:
+      - SURVEY_DROP_LOCAL_MAC=n
     platform_allow:
       - native_sim
       - native_sim/native/64

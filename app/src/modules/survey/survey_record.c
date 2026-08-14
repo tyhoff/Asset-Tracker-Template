@@ -261,6 +261,7 @@ void survey_record_from_obs(const struct survey_observation *obs, uint32_t seque
 	if (obs->scan_valid) {
 		out->scan_valid = true;
 		out->scan = obs->scan;
+		out->scan_local_mac_dropped = obs->scan_local_mac_dropped;
 	}
 
 	/* gnss_after and every offset stay absent: the cache has no second fix, and its
@@ -323,6 +324,16 @@ int survey_record_encode(const struct survey_record_data *rec, uint8_t *buf, siz
 	if (rec->network_mode != SURVEY_NETWORK_MODE_UNKNOWN) {
 		out.network_mode_m.network_mode_m = (uint32_t)rec->network_mode;
 		out.network_mode_m_present = true;
+	}
+
+	/* Absent when nothing was dropped, per the schema's absent-not-zero rule. Here that
+	 * rule earns its keep twice over: absent also correctly describes a record written
+	 * by a build with the filter compiled out, which did not drop anything and could
+	 * not have.
+	 */
+	if (rec->scan_valid && rec->scan_local_mac_dropped > 0) {
+		out.ap_dropped_m.ap_dropped_m = rec->scan_local_mac_dropped;
+		out.ap_dropped_m_present = true;
 	}
 
 	err = cbor_encode_survey_record(buf, buf_len, &out, out_len);

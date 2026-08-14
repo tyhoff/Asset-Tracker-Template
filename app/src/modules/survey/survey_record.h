@@ -43,7 +43,7 @@ extern "C" {
  *
  * This is the number storage capacity is planned from, and the encoder's unit test
  * asserts a fully populated DEEP record against it -- 10 APs, 10 neighbours, 3 GCI cells
- * and both bracketing fixes measured at 583 B. A schema change that pushes past this is a
+ * and both bracketing fixes measured at 585 B. A schema change that pushes past this is a
  * capacity decision about how many days of data fit on the device, so it should fail a
  * build rather than turn up during a drive.
  */
@@ -109,6 +109,14 @@ struct survey_record_data {
 
 	bool scan_valid;
 	struct location_cloud_request_data scan;
+
+	/** Access points the BSSID filter removed before @c scan was built.
+	 *
+	 * Carried into the record because the filter is destructive: the unfiltered scan is
+	 * gone once the zbus callback returns, so a record that omitted this could not later
+	 * distinguish a quiet location from a heavily filtered one.
+	 */
+	uint16_t scan_local_mac_dropped;
 
 	enum survey_network_mode network_mode;
 };

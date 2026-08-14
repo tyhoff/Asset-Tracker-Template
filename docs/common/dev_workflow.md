@@ -597,6 +597,129 @@ The variants themselves come from `extra_args` in `testcase.yaml`, which twister
 `-D`. Unit tests do not source the application's Kconfig, so an application `choice` symbol has to
 arrive as a `target_compile_definitions` entry selected by that CMake variable.
 
+`TEST_IGNORE_MESSAGE` is the fallback, not the first choice. Where the behaviour differs by a value
+rather than by existing at all, branch on the expectation and assert in both variants — the BSSID
+filter's suite does this:
+
+```c
+#define FILTER_ON IS_ENABLED(CONFIG_APP_SURVEY_DROP_LOCAL_MAC)
+...
+TEST_ASSERT_EQUAL_UINT16(FILTER_ON ? 1 : 3, obs.scan.wifi_cnt);
+```
+
+Nothing is ignored, so nothing can be ignored in *every* variant, and the off setting is asserted
+rather than merely compiled.
+
+### A new filter can silently eat an existing test fixture
+
+`survey_obs`'s fixture BSSID was `AA:BB:CC:DD:EE:FF`, and `0xAA` has the locally-administered bit
+set. Adding the BSSID filter would have dropped the fixture AP inside a dozen tests that are about
+something else entirely, and they would have failed for a reason nowhere near the change.
+
+Before adding any filter, grep the suites for literals of whatever it filters on and check them
+against the new predicate by hand. Fixture values get chosen for being readable, not for being
+representative — `0xAA` was picked because it is a recognisable byte, which is exactly why it is a
+randomised MAC. The fix was `0xA8`, plus the two assertions that spelled the address out.
+
+### An assertion that holds in only one of a suite's two configurations
+
+`test_a_full_array_with_the_last_entry_randomised` asserted every surviving AP had a global first
+octet. True with `APP_SURVEY_DROP_LOCAL_MAC=y`; false with `=n`, where the randomised entry survives
+by design:
+
+```
+src/survey_obs_test.c:828:test_a_full_array_with_the_last_entry_randomised:FAIL: Expected 168 Was 2
+```
+
+The `FILTER_ON` ternary was already threaded through the counts in that test, so the miss was in the
+one assertion that read like an invariant rather than like a filter outcome. Assert against the
+fixture — `macs[i]`, not `GLOBAL_MAC_0` — and the line is correct in both configurations without a
+conditional at all. When a suite has two Kconfig configurations, read every assertion twice, once
+per configuration; `-T tests/module/survey` alone runs both and takes about four minutes.
+
+### Flash then run, and the first hardware test races the boot banner
+
+`nrfutil device program` leaves the device resetting, so a suite started in the same command line
+runs its first test against a console still printing:
+
+```
+  shell_responds   FAIL  (1.5s)
+      no survey command group -- wrong build or wrong port
+      uart:~$ [00:00:00.524,932] <inf> littlefs: LittleFS version 2.11, disk version 2.1
+      uart:~$ *** Booting Asset Tracker Template v1.5.4-dev-582d90c51546 ***
+```
+
+The failure message accuses the build and the port, which are both fine. The other 22 tests pass,
+because by then the line is quiet.
+
+`console.drain()` does not prevent it: 0.15 s quiet threshold, 1.5 s ceiling, and boot output has
+gaps longer than the first and runs past the second, so it returns mid-banner. Those constants are
+right for draining between commands, so `Device.wake()` now does its own settle — quiet for 1 s,
+ceiling 20 s — rather than changing the shared helper. Reproduce by flashing and launching the
+suite in one command; running the suite against an already-booted device will not show it.
+
+### Some overruns are untestable, and the answer is to delete the arithmetic
+
+Mutating the tail-zeroing `memset` in `drop_local_mac_aps()` to run one entry long left both
+configurations of `tests/module/survey` green. The boundary test written specifically to catch it
+did not, and its comment claimed otherwise.
+
+The reason is layout, and it is worth reading the actual offsets rather than reasoning about field
+order — `arm-zephyr-eabi-gdb -batch -ex "ptype /o struct survey_observation" build-*/app/zephyr/zephyr.elf`
+prints them with the holes and padding marked, which is the fastest way to settle a question like
+this. For this build:
+
+```
+/*    858      |     100 */        struct location_wifi_ap_info wifi_aps[10];
+/* XXX  2-byte padding   */                     <- end of struct location_cloud_request_data
+/*    960      |       2 */    uint16_t scan_local_mac_dropped;
+/* XXX  6-byte padding   */                     <- total size 968
+```
+
+A one-entry overrun is 10 bytes and lands in exactly those 2 + 2 + 6. It never leaves the struct, so
+ASAN cannot redzone it, and the only live bytes it touches are the counter `survey_obs_update()`
+assigns on the very next line — overwritten before anything can observe it.
+
+Note the margin: **zero bytes**. This is a coincidence of padding, not a safety property. Append one
+member after `scan_local_mac_dropped`, or change `CONFIG_APP_LOCATION_WIFI_APS_MAX`, and the same
+slip becomes a genuine write past the end of a `.bss` object — which ASAN *would* catch. The
+conclusion below does not depend on which of those two worlds you are in, but "it's harmless" does,
+so do not carry that half forward.
+
+Do not keep writing tests for a bug the public surface cannot expose. Make the bound derive from
+the object instead of from a counter:
+
+```c
+memset(&scan->wifi_aps[kept], 0, (ARRAY_SIZE(scan->wifi_aps) - kept) * sizeof(scan->wifi_aps[0]));
+```
+
+`kept` is bounded by `count`, which is already clamped to `ARRAY_SIZE`, so this cannot address past
+the end whatever the counters do. Zeroing the whole remainder rather than just the compaction gap
+is also better hygiene — it clears entries left by an earlier, longer scan.
+
+The general rule: when a mutation survives, find out *why* before adding another assertion. If the
+answer is "the corruption is unobservable," the test is not the thing that needs fixing.
+
+### Regenerating host fixtures needs a twister out-dir the host can see
+
+`scripts/run_unit_tests.sh` passes `-O /tmp/twister-out`, which is inside the container, so
+`handler.log` never reaches the host and `scripts/survey_fixture.py` has nothing to read. Run the
+`docker run` from that script by hand with an extra mount and `-O` pointed inside it:
+
+```
+-v /Users/tyler/junk/twister-out:/work/out ... -O /work/out/run
+```
+
+`-O /work/out` — the mount point itself — fails on a re-run, because twister *moves* an existing
+out-dir aside before starting and a bind mount cannot be renamed:
+
+```
+OSError: [Errno 16] Device or resource busy: '/work/out'
+```
+
+Point `-O` at a child of the mount, never at the mount root. This is a different failure from the
+`/tmp` permission one above, and it only appears on the second run.
+
 ### Break the code to see whether the test noticed
 
 A test that stores one record into a partition `setUp()` just cleared and then asserts the unused
@@ -614,6 +737,24 @@ src/survey_store_test.c:318:test_the_unused_tail_of_a_slot_is_zeroed:FAIL: Expec
 Worth doing for any test whose expected value is zero, empty, or absent, because that is also what a
 freshly initialised system looks like. The fix for this one was to dirty every slot with a maximal
 record and drain before storing the small record under test.
+
+The same trap catches **single-assignment propagation paths** — a field copied from one struct to
+the next on its way to flash. `scan_local_mac_dropped` reached the stored record through exactly two
+lines, `survey_capture.c:432` and `survey_record.c:264`, and deleting either left all 17
+configurations green: the capture fake never set the source field and the `from_obs` tests never set
+it either, so both sides were comparing 0 against 0. In the export the loss is invisible too —
+absent means "nothing was dropped", which is precisely what a missing assignment produces.
+
+So when a value crosses a struct boundary, set it to something **non-zero** in the fixture on the
+far side of the boundary, and assert it on the near side. Then mutate to confirm:
+
+```sh
+src/survey_capture_test.c:620:...:FAIL: Expected 2 Was 0. the dropped-AP count did not reach the record
+src/survey_record_test.c:543:...:FAIL: survey_record_from_obs() did not carry the dropped-AP count
+```
+
+Count the boundaries, not the functions: a field that looks covered because the encoder round-trips
+it may still have no coverage on the hop *into* the encoder's input struct.
 
 ### A fake built on a message subscriber cannot model a module that discards
 
@@ -944,12 +1085,44 @@ that will be wrong.
 ## Before committing
 
 1. All three builds pass (survey overlay, default, and — if the change touches anything `survey fill`
-   or another default-off option compiles — the fill build).
+   or another default-off option compiles — the fill build), plus one build of the *off* arm of any
+   Kconfig the change adds or branches on (see below).
 2. Unit tests pass, and any new test appears in the per-test output.
 3. Behaviour verified on target — every commit must be flashable and working, not merely compiling.
    `tests/hardware/survey_hwtest.py --radio` is the floor; add a case there for whatever the commit
    changed.
 4. A senior-firmware-engineer review of the changeset in a separate context.
+
+### `#if` around a Kconfig hides the branch nobody builds
+
+`survey.c` had an `#if defined(CONFIG_APP_SURVEY_DROP_LOCAL_MAC)` with an `#else` that **no build
+in the verification set ever compiled**: `survey.c` is not in any native_sim suite, the option
+defaults `y`, and all three application builds take it. The `#else` could have referenced a deleted
+variable or the wrong format specifier and every gate above would still have been green. The
+native_sim suite's `keep_local_mac` configuration does not help — it builds `survey_obs.c`, not the
+zbus glue.
+
+Two fixes, and take both:
+
+- Prefer `if (IS_ENABLED(CONFIG_...))` to `#if`. Both arms then have to type-check in every
+  configuration and the dead one is optimised out, so the compiler covers the branch no test suite
+  reaches. It also removes the `ARG_UNUSED` that the `#else` arm needed.
+- Build the off configuration once, as an *application* image, before committing a change that adds
+  one:
+
+  ```
+  west build -b thingy91x/nrf9151/ns --sysbuild -d build-att-nodroplocal ../Asset-Tracker-Template/app \
+      -- -DEXTRA_CONF_FILE=overlay-survey.conf -DEXTRA_DTC_OVERLAY_FILE=overlay-survey.overlay \
+         -DCONFIG_APP_SURVEY_DROP_LOCAL_MAC=n
+  ```
+
+  A `-DCONFIG_*` on a sysbuild command line is silently ignored in more places than it is honoured,
+  so confirm it landed rather than trusting it — per the section below, read
+  `build-att-nodroplocal/app/zephyr/.config` and expect `# CONFIG_APP_SURVEY_DROP_LOCAL_MAC is not
+  set`. A build that quietly kept `=y` proves nothing and looks identical.
+
+The general form: any Kconfig with a default-off (or default-on) sibling arm needs one build of the
+non-default arm in the checklist, or the arm is unverified code.
 
 ### Check Kconfig claims against the generated `.config`, not against upstream defaults
 

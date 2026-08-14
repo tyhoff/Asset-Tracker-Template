@@ -59,6 +59,7 @@ static void survey_location_cb(const struct zbus_channel *chan)
 	const struct location_msg *msg = zbus_chan_const_msg(chan);
 	enum survey_time_base time_base;
 	int64_t now_ms;
+	struct survey_obs_scan_counts counts;
 
 	if (msg->type != LOCATION_GNSS_DATA && msg->type != LOCATION_CLOUD_REQUEST) {
 		/* Lifecycle events (started, done) carry no data, so the orchestrator can be
@@ -71,7 +72,7 @@ static void survey_location_cb(const struct zbus_channel *chan)
 	}
 
 	survey_time_now(&now_ms, &time_base);
-	survey_obs_update(msg, now_ms, time_base);
+	counts = survey_obs_update(msg, now_ms, time_base);
 
 	/* Result events: notify *after* the cache is written, never before.
 	 *
@@ -93,9 +94,37 @@ static void survey_location_cb(const struct zbus_channel *chan)
 		LOG_INF("GNSS fix cached (%s time base). Run \"survey show\".",
 			time_base == SURVEY_TIME_BASE_UNIX ? "unix" : "uptime");
 	} else {
-		LOG_INF("Scan cached: %u neighbor(s), %u gci, %u AP(s). Run \"survey show\".",
-			msg->cloud_request.ncells_count, msg->cloud_request.gci_cells_count,
-			msg->cloud_request.wifi_cnt);
+		/* The AP count is counts.kept, which is what was *cached*, not the count the
+		 * modem reported: locally-administered BSSIDs are dropped on the way in, and a
+		 * log line that disagreed with "survey show" would send someone looking for a
+		 * bug in the storage path. Taking it from the return value rather than
+		 * subtracting from msg->cloud_request.wifi_cnt also means no arithmetic here can
+		 * disagree with what was stored -- survey_obs_update() bounds the count to the
+		 * destination array, so the message's own wifi_cnt is not always the right
+		 * starting point.
+		 *
+		 * IS_ENABLED rather than #if: both branches then have to type-check in both
+		 * configurations, which is the only thing that would have caught a build break
+		 * in the branch no build in the verification set compiles. The dead one is
+		 * optimised out.
+		 *
+		 * The parenthetical is dropped rather than printed as a zero when the filter is
+		 * off. Someone who set DROP_LOCAL_MAC=n did it to see the unfiltered air, and
+		 * telling them "0 randomised BSSID(s) dropped" on every scan reads as a filter
+		 * that is running and finding nothing. The formatter suppresses its line for the
+		 * same reason.
+		 */
+		if (IS_ENABLED(CONFIG_APP_SURVEY_DROP_LOCAL_MAC)) {
+			LOG_INF("Scan cached: %u neighbor(s), %u gci, %u AP(s) "
+				"(%u randomised BSSID(s) dropped). Run \"survey show\".",
+				msg->cloud_request.ncells_count,
+				msg->cloud_request.gci_cells_count, counts.kept, counts.dropped);
+		} else {
+			LOG_INF("Scan cached: %u neighbor(s), %u gci, %u AP(s). "
+				"Run \"survey show\".",
+				msg->cloud_request.ncells_count,
+				msg->cloud_request.gci_cells_count, counts.kept);
+		}
 	}
 }
 

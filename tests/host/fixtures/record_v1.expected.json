@@ -240,6 +240,7 @@
         "macAddress": "94:2a:6f:c4:48:09",
         "signalStrength": -49
       }
-    ]
+    ],
+    "apDropped": 7
   }
 }
