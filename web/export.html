@@ -714,10 +714,25 @@ connectBtn.addEventListener("click", async () => {
 
     const [readOffset, writeOffset] = await readHeader(fs);
     const liveRecords = writeOffset - readOffset;
-    connStatus.textContent = `Connected. ${liveRecords} record(s) stored on the device.`;
+    // RECORDS_PER_TYPE is the file-count cap that fills the partition (see FW-6 in
+    // REQUIREMENTS.md), not a byte budget -- this is the same number the on-device
+    // "att_storage stats" command bounds against. Deliberately not projecting a
+    // time-to-full here: the capture interval is runtime-settable ("survey interval"), so
+    // this page has no reliable way to know the device's current cadence without adding a
+    // new fs_mgmt read just for that estimate.
+    const capacityPct = (liveRecords / RECORDS_PER_TYPE) * 100;
+    const capacityText = `${liveRecords} / ${RECORDS_PER_TYPE} slots used (${capacityPct.toFixed(1)}%)`;
+    connStatus.textContent = `Connected. ${liveRecords} record(s) stored on the device. ${capacityText}.`;
+    connStatus.className = capacityPct >= 90 ? "status error" : "status";
     exportBtn.disabled = liveRecords === 0;
     if (liveRecords === 0) exportStatus.textContent = "Nothing to export.";
-    log(`connected: ${liveRecords} live record(s) (read_offset=${readOffset}, write_offset=${writeOffset})`, "ok");
+    if (capacityPct >= 90) {
+      // FW-6's default is APP_STORAGE_FULL_STOP: once every slot is used, the device stops
+      // recording rather than wrapping over the oldest data. So a full partition is silent
+      // data loss for the rest of the trip, not gradual loss of the oldest records.
+      log(`storage is ${capacityPct.toFixed(1)}% full -- the device stops recording once it's full, so export and clear soon or the rest of the trip won't be captured`, "error");
+    }
+    log(`connected: ${liveRecords} live record(s) (read_offset=${readOffset}, write_offset=${writeOffset}), ${capacityText}`, "ok");
   } catch (err) {
     connStatus.textContent = `Connection failed: ${err.message}`;
     connStatus.className = "status error";
