@@ -170,6 +170,25 @@ bool survey_capture_radio_busy(void);
 /** @brief Copy the timing of the most recent completed cycle. */
 void survey_capture_timing_get(struct survey_capture_timing *out);
 
+/** @brief Change the period of the automatic capture timer (FW-7).
+ *
+ * Takes effect on the timer's next reschedule, which happens right after the tick this is
+ * called during finishes (or immediately, if the timer is currently idle waiting on one).
+ * A cycle already in flight is not affected.
+ *
+ * @param seconds New period. Must be nonzero; the caller (the shell command) is what
+ *                enforces FW-7's 10-30 s target, not this function -- a bench session
+ *                driving one cycle at a time still needs to be able to set something
+ *                outside that band.
+ *
+ * @retval 0       Accepted.
+ * @retval -EINVAL @p seconds is 0.
+ */
+int survey_capture_set_interval(uint32_t seconds);
+
+/** @brief Read the current period of the automatic capture timer (FW-7). */
+uint32_t survey_capture_get_interval(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -399,23 +399,30 @@ static void trigger_sampling(struct main_state *state_object)
 	};
 
 #if defined(CONFIG_APP_LED)
-	/* Blue pattern to indicate sampling */
-	struct led_msg led_msg = {
-		.type = LED_RGB_SET,
-		.red = 0,
-		.green = 0,
-		.blue = 55,
-		.duration_on_msec = 250,
-		.duration_off_msec = 2000,
-		.repetitions = 10,
-	};
+	/* Blue pattern to indicate sampling. Survey builds skip this: CONFIG_APP_LED defaults
+	 * to y on this board regardless of survey mode, and this trigger fires on its own
+	 * schedule even when CONFIG_APP_SURVEY_CAPTURE_OWNS_SEARCH is discarding the search it
+	 * requests, which would otherwise collide with the LED states the survey module owns
+	 * (see survey_capture.c's cadence timer, FW-9).
+	 */
+	if (!IS_ENABLED(CONFIG_APP_SURVEY)) {
+		struct led_msg led_msg = {
+			.type = LED_RGB_SET,
+			.red = 0,
+			.green = 0,
+			.blue = 55,
+			.duration_on_msec = 250,
+			.duration_off_msec = 2000,
+			.repetitions = 10,
+		};
 
-	err = zbus_chan_pub(&led_chan, &led_msg, PUB_TIMEOUT);
-	if (err) {
-		LOG_ERR("Failed to publish LED pattern message, error: %d", err);
-		SEND_FATAL_ERROR();
+		err = zbus_chan_pub(&led_chan, &led_msg, PUB_TIMEOUT);
+		if (err) {
+			LOG_ERR("Failed to publish LED pattern message, error: %d", err);
+			SEND_FATAL_ERROR();
 
-		return;
+			return;
+		}
 	}
 #endif /* CONFIG_APP_LED */
 
@@ -518,24 +525,26 @@ static void cloud_send_now(struct main_state *state_object)
 	poll_triggers_send();
 
 #if defined(CONFIG_APP_LED)
-	int err;
-	/* Green pattern to indicate sending */
-	struct led_msg led_msg = {
-		.type = LED_RGB_SET,
-		.red = 0,
-		.green = 55,
-		.blue = 0,
-		.duration_on_msec = 250,
-		.duration_off_msec = 2000,
-		.repetitions = 10,
-	};
+	/* Green pattern to indicate sending. Survey builds skip this; see trigger_sampling(). */
+	if (!IS_ENABLED(CONFIG_APP_SURVEY)) {
+		int err;
+		struct led_msg led_msg = {
+			.type = LED_RGB_SET,
+			.red = 0,
+			.green = 55,
+			.blue = 0,
+			.duration_on_msec = 250,
+			.duration_off_msec = 2000,
+			.repetitions = 10,
+		};
 
-	err = zbus_chan_pub(&led_chan, &led_msg, PUB_TIMEOUT);
-	if (err) {
-		LOG_ERR("Failed to publish LED pattern message, error: %d", err);
-		SEND_FATAL_ERROR();
+		err = zbus_chan_pub(&led_chan, &led_msg, PUB_TIMEOUT);
+		if (err) {
+			LOG_ERR("Failed to publish LED pattern message, error: %d", err);
+			SEND_FATAL_ERROR();
 
-		return;
+			return;
+		}
 	}
 #endif /* CONFIG_APP_LED */
 }
@@ -1075,24 +1084,30 @@ static void disconnected_waiting_entry(void *o)
 	waiting_entry_common(state_object);
 
 #if defined(CONFIG_APP_LED)
-	int err;
-	/* Red pattern indicating disconnected */
-	struct led_msg led_msg = {
-		.type = LED_RGB_SET,
-		.red = 55,
-		.green = 0,
-		.blue = 0,
-		.duration_on_msec = 250,
-		.duration_off_msec = 2000,
-		.repetitions = 10,
-	};
+	/* Red pattern indicating disconnected. Survey builds skip this: red is reserved for
+	 * the survey module's own error/storage-full state, and this trigger would otherwise
+	 * fire on every disconnect regardless of whether surveying itself is healthy. See
+	 * trigger_sampling().
+	 */
+	if (!IS_ENABLED(CONFIG_APP_SURVEY)) {
+		int err;
+		struct led_msg led_msg = {
+			.type = LED_RGB_SET,
+			.red = 55,
+			.green = 0,
+			.blue = 0,
+			.duration_on_msec = 250,
+			.duration_off_msec = 2000,
+			.repetitions = 10,
+		};
 
-	err = zbus_chan_pub(&led_chan, &led_msg, PUB_TIMEOUT);
-	if (err) {
-		LOG_ERR("Failed to publish LED pattern, error: %d", err);
-		SEND_FATAL_ERROR();
+		err = zbus_chan_pub(&led_chan, &led_msg, PUB_TIMEOUT);
+		if (err) {
+			LOG_ERR("Failed to publish LED pattern, error: %d", err);
+			SEND_FATAL_ERROR();
 
-		return;
+			return;
+		}
 	}
 #endif /* CONFIG_APP_LED */
 }
@@ -1278,24 +1293,31 @@ static void fota_entry(void *o)
 	LOG_DBG("%s", __func__);
 
 #if defined(CONFIG_APP_LED)
-	int err;
-	/* Purple pattern during download - indefinite for ongoing process */
-	struct led_msg led_msg = {
-		.type = LED_RGB_SET,
-		.red = 160,
-		.green = 32,
-		.blue = 240,
-		.duration_on_msec = 250,
-		.duration_off_msec = 2000,
-		.repetitions = -1,
-	};
+	/* Purple pattern during download - indefinite for ongoing process. Survey builds skip
+	 * this: the survey module's cadence timer (FW-7) republishes green/red to led_chan every
+	 * cadence_interval_s, which is <=30 s by the FW-7 target, so an "indefinite" purple
+	 * pattern left ungated here would be overwritten within one cadence tick and never
+	 * actually be visible for the duration of a download. See trigger_sampling().
+	 */
+	if (!IS_ENABLED(CONFIG_APP_SURVEY)) {
+		int err;
+		struct led_msg led_msg = {
+			.type = LED_RGB_SET,
+			.red = 160,
+			.green = 32,
+			.blue = 240,
+			.duration_on_msec = 250,
+			.duration_off_msec = 2000,
+			.repetitions = -1,
+		};
 
-	err = zbus_chan_pub(&led_chan, &led_msg, PUB_TIMEOUT);
-	if (err) {
-		LOG_ERR("Failed to publish LED FOTA download pattern, error: %d", err);
-		SEND_FATAL_ERROR();
+		err = zbus_chan_pub(&led_chan, &led_msg, PUB_TIMEOUT);
+		if (err) {
+			LOG_ERR("Failed to publish LED FOTA download pattern, error: %d", err);
+			SEND_FATAL_ERROR();
 
-		return;
+			return;
+		}
 	}
 #endif /* CONFIG_APP_LED */
 }

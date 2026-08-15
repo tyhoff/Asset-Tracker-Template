@@ -47,6 +47,10 @@ target_compile_definitions(app PRIVATE
   -DCONFIG_APP_SURVEY_CAPTURE_SCAN_TIMEOUT_SECONDS=5
   -DCONFIG_APP_SURVEY_CAPTURE_IDLE_TIMEOUT_SECONDS=5
   -DCONFIG_APP_SURVEY_CAPTURE_THREAD_STACK_SIZE=4096
+  # FW-7's cadence timer. Not exercised by this suite's sequencing tests (its SYS_INIT
+  # schedules a real k_work_delayable, which the suite does not drive), just needed for the
+  # translation unit to compile; any value in the Kconfig range does.
+  -DCONFIG_APP_SURVEY_CAPTURE_INTERVAL_SECONDS=20
   -DCONFIG_APP_LOCATION_WIFI_APS_MAX=10
   -DCONFIG_APP_LOCATION_NEIGHBOR_CELLS_MAX=10
   -DCONFIG_LTE_NEIGHBOR_CELLS_MAX=10

@@ -20,6 +20,9 @@
 #include "survey_record.h"
 #include "survey_store.h"
 #include "survey.h"
+#if defined(CONFIG_APP_LED)
+#include "led.h"
+#endif
 
 #if defined(CONFIG_APP_SURVEY_LOG_LEVEL)
 #include <zephyr/logging/log.h>
@@ -365,6 +368,38 @@ static bool run_step(enum location_msg_type type, uint32_t wanted, k_timeout_t t
 	return true;
 }
 
+/* FW-9: an operator with no console has exactly the LED to tell whether the device is
+ * working. Two states, not five -- see REQUIREMENTS.md's FW-9 note on what CP10 actually
+ * shipped versus what it specifies. Green latches on the cycle that stored something; red
+ * latches on the cycle that did not, and clears itself the moment a later cycle succeeds.
+ * -1 repetitions so the pattern holds until the next cycle overwrites it, rather than
+ * going dark and reading as "device is off" a couple of seconds after a capture completes.
+ */
+#if defined(CONFIG_APP_LED)
+static void survey_led_signal(bool ok)
+{
+	struct led_msg led_msg = {
+		.type = LED_RGB_SET,
+		.red = ok ? 0 : 55,
+		.green = ok ? 55 : 0,
+		.blue = 0,
+		.duration_on_msec = 250,
+		.duration_off_msec = 2000,
+		.repetitions = -1,
+	};
+	int err = zbus_chan_pub(&led_chan, &led_msg, K_MSEC(100));
+
+	if (err) {
+		LOG_WRN("Failed to publish survey LED pattern: %d", err);
+	}
+}
+#else
+static inline void survey_led_signal(bool ok)
+{
+	ARG_UNUSED(ok);
+}
+#endif /* CONFIG_APP_LED */
+
 static void capture_cycle(enum survey_profile profile, int wdt_id)
 {
 	struct survey_capture_timing timing = {
@@ -484,16 +519,19 @@ static void capture_cycle(enum survey_profile profile, int wdt_id)
 	if (!cycle_record.scan_valid && !cycle_record.gnss_before_valid &&
 	    !cycle_record.gnss_after_valid) {
 		LOG_WRN("Cycle %u produced nothing; not stored", cycle_record.sequence);
+		survey_led_signal(false);
 	} else {
 		err = survey_store_publish_record(&cycle_record);
 		if (err) {
 			LOG_WRN("Cycle %u not stored: %d", cycle_record.sequence, err);
+			survey_led_signal(false);
 		} else {
 			LOG_INF("Cycle %u stored: gnss %s/%s, scan %s",
 				cycle_record.sequence,
 				cycle_record.gnss_before_valid ? "ok" : "--",
 				cycle_record.gnss_after_valid ? "ok" : "--",
 				cycle_record.scan_valid ? "ok" : "--");
+			survey_led_signal(true);
 		}
 	}
 
@@ -581,3 +619,62 @@ void survey_capture_timing_get(struct survey_capture_timing *out)
 	*out = last_timing;
 	k_mutex_unlock(&timing_lock);
 }
+
+/* FW-7: the device has to record with nobody there to type "survey capture". Before this,
+ * survey_capture_request() had exactly one caller -- the shell command -- so a headless
+ * build did nothing forever. This timer is the second caller.
+ *
+ * Reschedules itself from the handler rather than using k_timer's own periodic mode, so
+ * that a cycle running long (GNSS can take the full SURVEY_CAPTURE_WORST_CASE_SECONDS) is a
+ * dropped tick, not a queued one: k_timer would fire again mid-cycle and every one of those
+ * extra fires would see -EALREADY, but the interval between *starts* would drift shorter
+ * than the interval that was set. Rescheduling only after the request is made, whatever the
+ * result, keeps the interval a floor on the gap between cycles instead.
+ */
+static atomic_t cadence_interval_s = ATOMIC_INIT(CONFIG_APP_SURVEY_CAPTURE_INTERVAL_SECONDS);
+
+int survey_capture_set_interval(uint32_t seconds)
+{
+	if (seconds == 0) {
+		return -EINVAL;
+	}
+
+	atomic_set(&cadence_interval_s, (atomic_val_t)seconds);
+
+	return 0;
+}
+
+uint32_t survey_capture_get_interval(void)
+{
+	return (uint32_t)atomic_get(&cadence_interval_s);
+}
+
+#if defined(CONFIG_APP_SURVEY_CAPTURE_CADENCE_AUTOSTART)
+static void cadence_work_handler(struct k_work *work)
+{
+	int err = survey_capture_request(SURVEY_PROFILE_FAST);
+
+	if (err && err != -EALREADY) {
+		LOG_WRN("Automatic capture trigger failed: %d", err);
+	}
+
+	k_work_reschedule(k_work_delayable_from_work(work),
+			   K_SECONDS(atomic_get(&cadence_interval_s)));
+}
+
+static K_WORK_DELAYABLE_DEFINE(cadence_work, cadence_work_handler);
+
+static int cadence_start(void)
+{
+	/* APPLICATION, not an earlier level: the system workqueue this schedules onto must
+	 * already be running, which it is by POST_KERNEL. survey_capture_request() itself
+	 * only needs cycle_slot and cycle_go, both statically initialised, so it is safe to
+	 * call from here even though the capture thread (K_THREAD_DEFINE below) is scheduled
+	 * by the kernel rather than started by a SYS_INIT of its own.
+	 */
+	k_work_schedule(&cadence_work, K_SECONDS(atomic_get(&cadence_interval_s)));
+
+	return 0;
+}
+SYS_INIT(cadence_start, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
+#endif /* CONFIG_APP_SURVEY_CAPTURE_CADENCE_AUTOSTART */

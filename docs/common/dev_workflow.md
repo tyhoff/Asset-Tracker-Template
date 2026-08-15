@@ -797,6 +797,27 @@ The general rule is the one above: if a mutation of the code under test does not
 the test does not cover it. That applies to concurrency tests too, and concurrency is where a test is
 most likely to look convincing while covering nothing.
 
+### A `SYS_INIT` timer under `--whole-archive` really runs in the test binary
+
+`tests/module/survey_capture` links `survey_capture.c` with `target_link_options(app PRIVATE
+--whole-archive)`, so every `SYS_INIT`-registered function in that file executes during the test
+binary's own boot, not just in a real device build — there is no "it's just linked in, not called"
+escape hatch. Adding FW-7's cadence timer (a `SYS_INIT` that schedules a `k_work_delayable` calling
+`survey_capture_request()` on its own) meant that hook really started firing during the suite,
+racing its own deterministic request/response assertions — and racing for real: the test's
+`prj.conf` sets `CONFIG_NATIVE_SIM_SLOWDOWN_TO_REAL_TIME=y` (needed elsewhere to assert on measured
+durations, see CP6), so a 20 s timer genuinely takes 20 real seconds, well inside the suite's own
+~30 s worst-case cycle.
+
+Fixed with a hidden Kconfig symbol (`bool`, no prompt, `default y`) that the real `Kconfig.survey`
+sets but the test's `CMakeLists.txt` — which defines the module's Kconfig symbols via
+`target_compile_definitions` rather than sourcing `Kconfig.survey` at all — simply never defines.
+Wrapping the `SYS_INIT` registration (and everything only it needs, like the `k_work_delayable`
+itself) in `#if defined(...)` compiles the autostart out of the test binary entirely, rather than
+trying to make the timer itself race-proof. The general lesson: before adding any `SYS_INIT` to a
+module a `--whole-archive` unit test links, check whether that test's Kconfig approach would leave
+it silently enabled, and give it an explicit off-switch if so.
+
 ### Capacity arithmetic on the LittleFS backend
 
 Record capacity is bounded by **blocks, not bytes**. The backend stores one file per block

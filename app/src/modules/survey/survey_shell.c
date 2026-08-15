@@ -617,6 +617,55 @@ static int cmd_survey_timing(const struct shell *sh, size_t argc, char **argv)
 
 	return 0;
 }
+
+static int cmd_survey_interval(const struct shell *sh, size_t argc, char **argv)
+{
+	if (argc == 1) {
+		shell_print(sh, "Automatic capture interval: %u s", survey_capture_get_interval());
+
+		return 0;
+	}
+
+	char *endptr;
+
+	errno = 0;
+	long seconds = strtol(argv[1], &endptr, 10);
+
+	if (errno == ERANGE || *endptr != '\0' || endptr == argv[1] ||
+	    seconds <= 0 || seconds > UINT32_MAX) {
+		shell_error(sh, "Invalid interval \"%s\"; expected a positive number of seconds",
+			    argv[1]);
+
+		return -EINVAL;
+	}
+
+	/* Hard floor/ceiling matches Kconfig.survey's APP_SURVEY_CAPTURE_INTERVAL_SECONDS range:
+	 * below 5 s starts to compete with a cycle's own worst-case duration, and there is no
+	 * legitimate reason to want longer than an hour between cycles. Reject rather than warn
+	 * here, unlike the FW-7 band below -- this device is meant to run unattended, and a
+	 * fat-fingered "interval 1" or "interval 999999" from a bench session left on a fielded
+	 * unit should not silently take effect.
+	 */
+	if (seconds < 5 || seconds > 3600) {
+		shell_error(sh, "%ld s is outside the allowed 5-3600 s range.", seconds);
+
+		return -EINVAL;
+	}
+
+	/* FW-7 targets 10-30 s; warned rather than rejected outside that band, since a bench
+	 * session driving one cycle at a time deliberately sets this far outside it (see
+	 * "survey capture" for a single on-demand cycle instead).
+	 */
+	if (seconds < 10 || seconds > 30) {
+		shell_warn(sh, "%ld s is outside FW-7's 10-30 s target; setting it anyway.",
+			   seconds);
+	}
+
+	(void)survey_capture_set_interval((uint32_t)seconds);
+	shell_print(sh, "Automatic capture interval set to %ld s.", seconds);
+
+	return 0;
+}
 #endif /* CONFIG_APP_SURVEY_CAPTURE */
 
 /* SHELL_CMD_ARG with zero optional arguments, so that a mistyped "survey show 3" reports
@@ -655,6 +704,9 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_survey,
 	SHELL_CMD_ARG(timing, NULL,
 		      "Print how long the last capture cycle's steps took",
 		      cmd_survey_timing, 1, 0),
+	SHELL_CMD_ARG(interval, NULL,
+		      "Get or set the automatic capture interval in seconds (FW-7)",
+		      cmd_survey_interval, 1, 1),
 #endif
 	SHELL_SUBCMD_SET_END
 );

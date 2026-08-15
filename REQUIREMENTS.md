@@ -475,13 +475,34 @@ one-file-per-block layout that neither accounted for.
    If this ever does need fixing further, the lever is the backend's file layout — subdirectories,
    so the lookup is not O(total entries) — not the slot size and not more cache.
 
-### FW-7 — Cadence
+### FW-7 — Cadence ✅
 
 `CONFIG_APP_SAMPLING_INTERVAL_SECONDS` defaults to 600 s (`app/src/Kconfig.main:8-13`) — far too
-slow for driving. Add a survey interval targeting **10–30 s** for FAST, runtime-settable via shell.
-Reuse the existing trigger machinery in `main.c` (`trigger_sampling()` ~line 394,
-`K_WORK_DELAYABLE_DEFINE(timer_sample_data_work)` line 122) by adding a survey trigger rather than
-replacing the asset-tracker one.
+slow for driving. Before this, `survey_capture_request()` had exactly one caller in the whole
+codebase — the `survey capture` shell command — so a headless device driving around with no
+console attached would record nothing, ever. That gap was more fundamental than cadence tuning
+and is what this closes.
+
+**Not** built on `main.c`'s existing trigger machinery as originally sketched
+(`trigger_sampling()`, `timer_sample_data_work`) — that path routes through the
+`LOCATION_SEARCH_TRIGGER` zbus message, which `CONFIG_APP_SURVEY_CAPTURE_OWNS_SEARCH` already
+discards for survey builds, so reusing it would mean plumbing a message through a channel built to
+throw it away. Instead, `survey_capture.c` owns a self-rescheduling `k_work_delayable`
+(`cadence_work`) that calls `survey_capture_request(SURVEY_PROFILE_FAST)` directly and reschedules
+itself from its own handler rather than using `k_timer`'s periodic mode — a cycle that runs long
+(GNSS can take up to `SURVEY_CAPTURE_WORST_CASE_SECONDS`) is a dropped tick, not a queued one, so
+the configured interval is a floor on the gap between cycle *starts*, not a strict period that
+would otherwise drift short under `-EALREADY` retries.
+
+- `CONFIG_APP_SURVEY_CAPTURE_INTERVAL_SECONDS` (Kconfig, default 20 s, range 5–3600) sets the
+  boot-time interval within the 10–30 s target.
+- `survey interval [seconds]` (shell) reads or changes it at runtime with no reboot, per FW-7;
+  values outside 10–30 s are accepted with a warning rather than rejected, since a bench session
+  driving one cycle at a time deliberately sets this far outside the driving target.
+- `CONFIG_APP_SURVEY_CAPTURE_CADENCE_AUTOSTART` (hidden Kconfig, default y) exists purely so
+  `tests/module/survey_capture` — which links `survey_capture.c` whole and would otherwise really
+  run this timer against wall-clock time during the suite — can leave it undefined and compile the
+  autostart `SYS_INIT` out, keeping the suite deterministic.
 
 ### FW-8 — Export over USB (Web Serial) ✅
 
@@ -528,7 +549,7 @@ the shell and a dedicated uart1 CDC port answer SMP correctly (see
 `app/overlay-survey-export.overlay`'s header comment for how uart1 was routed there without
 colliding with modem tracing, which also wants it).
 
-### FW-9 — Field usability
+### FW-9 — Field usability ⚠️ partial
 
 Operators are employees driving vehicles, with no console attached.
 
@@ -536,6 +557,27 @@ Operators are employees driving vehicles, with no console attached.
   Reuse the existing `led` module.
 - Must run headless from cold boot with no host interaction.
 - Keep the task-watchdog coverage the template already provides on every module thread.
+
+**What CP10 actually shipped is 2 states, not 5:** `survey_capture.c`'s `survey_led_signal()`
+latches green on any cycle that stored a record, red on any cycle that didn't (empty result or a
+store failure), via the existing `led_chan` zbus channel — no separate "searching" state, no
+distinct GNSS-poor-fix signal, no storage-full signal. Repetitions is `-1` so the pattern holds
+until the next cycle overwrites it, rather than going dark a couple of seconds after a capture and
+reading as "device is off." The 3 remaining unimplemented states (searching, GNSS-poor-vs-absent,
+storage-full) are a real gap against the FW-9 text above, not an oversight — closing them cleanly
+needs the LED module to expose more than "set this pattern," which is out of scope for this pass.
+
+`main.c` publishes to `led_chan` on its own schedule for the asset-tracker's own states (blue
+"sampling", green "sending", red "disconnected", purple "FOTA download") — all four ungated
+against survey mode before this change, so a survey build's LEDs were showing whichever of the two
+modules published most recently rather than either coherently. Fixed by gating all four behind
+`!IS_ENABLED(CONFIG_APP_SURVEY)` in `main.c` (`trigger_sampling()`, `cloud_send_now()`,
+`disconnected_waiting_entry()`, `fota_entry()`). FOTA was initially left ungated on the theory that
+purple doesn't collide with survey's green/red palette, but pre-commit review caught that it does
+in practice: FOTA's pattern is meant to hold `repetitions = -1` for the whole download, and the
+FW-7 cadence timer republishes green/red to the same channel every `cadence_interval_s` (≤30 s), so
+an ungated purple pattern would be overwritten within one cadence tick and never actually be
+visible. Survey builds have no FOTA indicator; this is a known gap, not a design choice.
 
 ### FW-10 — Data hygiene
 
@@ -726,7 +768,7 @@ hardware**. `native_sim` proofs are the gate for merging; on-target proofs are r
 | **CP7** | FW-2 profiles FAST/DEEP + gating | Unit test: gating decisions across a speed/power truth table; assert DEEP requests GCI | `survey profile deep` yields multiple full-identity GCI cells; FAST does not |
 | **CP8** ✅ | FW-8 export over `fs_mgmt` (MCUmgr): `scripts/survey_smp.py` (SMP serial framing + fs_mgmt CBOR + `FsMgmt.stat/checksum_crc32/download`) and `scripts/survey_export.py` (CLI, walks the ring buffer, CRC32-verifies each file, writes a length-prefixed CBOR stream); `scripts/survey_decode.py` extended to parse that stream | **Done.** `tests/host` = **103/103** (up from 58 at CP4), stdlib only — `import serial` is deferred into `SmpSerial.__init__` so the framing, CBOR and `FsMgmt` stay testable via a fake transport without pyserial installed. `survey_export.py` itself carries PEP 723 metadata (`# /// script` dependency block) so `uv run scripts/survey_export.py ...` provisions pyserial into an isolated environment on first run — no system-Python `pip install` fight. Framing verified against Zephyr 4.4's own `fs_mgmt.c`/`crc32_sw.c` source rather than assumed field names; the CRC32 used is confirmed bit-identical to `zlib.crc32`. No firmware changes this checkpoint — CP6's on-flash layout is read as-is. Known limitation: no session header (see FW-8). | **Run on target.** `uv run scripts/survey_export.py --port /dev/cu.usbmodem105 --baud 1000000 ...` against a real Thingy:91 X: `--stats-only` reported 5,083 live records; a full export downloaded and CRC32-verified all of them, and every one decoded cleanly (5,083/5,083, all bytes consumed, no trailing garbage). This run also caught a real client bug the host tests never could — mcumgr's zcbor encoder returns **indefinite-length** CBOR maps (additional-info 31, terminated by a `0xFF` break byte) on real fs_mgmt responses, which the hand-rolled decoder in `survey_smp.py` didn't handle; fixed, host suite still 103/103 green. (Also observed: the record `sequence` field resets on device reboot rather than staying globally monotonic — real device behaviour, not a decoder defect; `--since` filtering does not assume global monotonicity, so this is not a problem for it.) |
 | **CP9** ✅ | HOST-2: `web/export.html`, a self-contained Chrome/Edge Web Serial page — connect, run the export, show progress and record count, save to a local file (browser download, no upload endpoint), surface CRC/length failures in a visible log | **Done.** The framing/CBOR/CRC16/CRC32/ring-walk port was extracted and run under Node against the same vectors as `tests/host/test_survey_smp.py` and `test_survey_export.py` (CRC16-XMODEM and CRC32 known vectors, multi-frame packet round trips, CBOR uint-width round trips including ≥2³², a two-file ring-buffer walk with per-file download caching) — all passing. Pre-commit review found and fixed two UI-state bugs (Disconnect left enabled during an in-flight export, racing the transport's pending read/write; button state not reset when the post-connect record-count read fails) and hardened the CBOR 8-byte-width decode path against silent 32-bit truncation (unreachable today, but wrong-not-erroring is worse than throwing). No "clear" control exists on the page. Opened in real Chrome via chrome-devtools MCP against the connected device: page loads with no console errors of its own, and the `#unsupported` Web-Serial-not-available branch correctly stays hidden (Chrome supports it). Clicking Connect correctly invokes the real `navigator.serial.requestPort()` and opens the OS-native device chooser — which is what real-browser testing caught and Node testing structurally could not: with no filter, that chooser listed every serial-capable device on the machine, including Bluetooth-serial peripherals (AirPods, a mouse), not just the Thingy:91 X. Fixed with a `usbVendorId: 0x1915` (Nordic Semiconductor, confirmed via `ioreg -p IOUSB -l` against the connected device) filter on `requestPort()`. | Full export from device via browser — Connect verified through the real native device picker; the OS-level chooser itself is outside what chrome-devtools MCP can drive (it's a sheet outside the page), so selecting the device and running Start Export end-to-end still needs a human click |
-| **CP10** | FW-7 cadence, FW-9 LEDs, FW-10 hygiene | Unit test: timer reschedule maths; assert ground-fix is never called | Headless cold-boot run; LED states legible; storage-full behaviour correct |
+| **CP10** ⚠️ partial | FW-7 cadence, FW-9 LEDs, FW-10 hygiene | `tests/module/survey_capture` passes with the cadence timer linked in (`CADENCE_AUTOSTART` compiled out so the suite's own assertions aren't raced by a real timer firing mid-test); no dedicated reschedule-maths test yet. Survey build FLASH 71.63–71.66 % / RAM 87.97 %, default build unchanged at 68.97 % / 82.47 % (confirms the LED gating is inert outside survey mode). | **Not yet run on target.** FW-7 (auto-capture, runtime-settable interval) and FW-9's 2-state green/red LED are implemented and build-verified but not hardware-verified; the LED model is 2 states, not the 5 FW-9 specifies (no searching/GNSS-poor/storage-full signal) — see FW-9 above. FW-10 hygiene not started. |
 
 **Note on CP4 — why the golden files are generated, not hand-written.** The first decoder was written
 from the CDDL and disagreed with the firmware on `time-base`: the schema documented `0 = Unix epoch,

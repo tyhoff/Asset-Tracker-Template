@@ -143,11 +143,12 @@ config APP_SURVEY_CAPTURE
 	  Enabling this makes the orchestrator the only thing that starts a
 	  search. See APP_SURVEY_CAPTURE_OWNS_SEARCH.
 
-	  Depends on APP_SURVEY_SHELL only because "survey capture" is currently
-	  the sole caller. Without the shell, and with OWNS_SEARCH suppressing the
-	  application's own sampling, the build is legal, silent and records
-	  nothing forever. FW-7's cadence timer (CP10) adds the second caller;
-	  drop this dependency then, not before.
+	  Depends on APP_SURVEY_SHELL for historical reasons: "survey capture" was
+	  the sole caller until APP_SURVEY_CAPTURE_INTERVAL_SECONDS (CP10) added
+	  the cadence timer as a second, shell-independent one. Left in place
+	  rather than dropped, since APP_SURVEY_SHELL defaults to y and a build
+	  that disables it is already off the beaten path -- but the timer alone
+	  is now enough to keep a device recording without a console attached.
 
 	  Selects LOCATION_DATA_DETAILS because the orchestrator sequences on the
 	  Location library's started event: it is what tells a step that the search
@@ -258,6 +259,43 @@ config APP_SURVEY_CAPTURE_IDLE_TIMEOUT_SECONDS
 	  done, and a trigger sent in that gap is discarded. Each step waits here
 	  for the done event before the next trigger, which is what makes the
 	  sequence real rather than hopeful.
+
+config APP_SURVEY_CAPTURE_INTERVAL_SECONDS
+	int "Seconds between automatic capture cycles"
+	range 5 3600
+	depends on APP_SURVEY_CAPTURE
+	default 20
+	help
+	  FW-7: the device must record while driving with no console attached, so a
+	  capture has to start itself. This is the period of the timer that calls
+	  survey_capture_request(SURVEY_PROFILE_FAST) on its own, with no shell
+	  command needed.
+
+	  10-30 s is the FW-7 target; 20 s is the midpoint. A tick that lands while
+	  the previous cycle is still running (which can take up to
+	  SURVEY_CAPTURE_WORST_CASE_SECONDS, minutes if GNSS is struggling) is not
+	  queued -- survey_capture_request() returns -EALREADY, the tick is
+	  dropped, and the timer reschedules for another full interval from then.
+	  So this is a floor on the gap between cycles, not a guaranteed cadence;
+	  see docs/common/dev_workflow.md for what was measured.
+
+	  Runtime-settable: "survey interval [seconds]" reads or changes this
+	  without a reboot, per FW-7 ("runtime-settable via shell"). The Kconfig
+	  default is only where it starts at boot.
+
+config APP_SURVEY_CAPTURE_CADENCE_AUTOSTART
+	bool
+	depends on APP_SURVEY_CAPTURE
+	default y
+	help
+	  Hidden: no prompt, nothing to set from a config fragment. Exists only so that
+	  tests/module/survey_capture's CMakeLists can leave it undefined, which compiles out
+	  the SYS_INIT that starts the FW-7 cadence timer.
+
+	  That suite drives survey_capture_request() directly against millisecond-scale
+	  fakes and asserts on the exact request/response sequence; a real timer left running
+	  would eventually call survey_capture_request() on its own mid-suite and turn a
+	  deterministic test flaky. Every real build keeps this on.
 
 config APP_SURVEY_EXPORT
 	bool "Restrict MCUmgr fs_mgmt to read-only access under /att_storage"
