@@ -1,0 +1,716 @@
+<!doctype html>
+<!--
+  Copyright (c) 2026 Nordic Semiconductor ASA
+  SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+
+  CP9 / HOST-2 -- Web Serial survey export page.
+
+  Self-contained: no external scripts, styles or fonts. Host it by uploading this one file
+  anywhere that serves static files over HTTPS (Web Serial requires a secure context) --
+  Cloudflare Pages, GitHub Pages, or just opening it from disk also works.
+
+  Requires Chrome or Edge; Web Serial is not implemented in Firefox or Safari.
+
+  Speaks the same MCUmgr SMP fs_mgmt protocol as scripts/survey_smp.py and
+  scripts/survey_export.py -- see those files for the reference implementation and the
+  reasoning behind the framing and the on-flash ring-buffer layout this walks. Read-only by
+  design: there is deliberately no "clear" control on this page. Clearing the partition is a
+  destructive, explicit-confirmation operation that belongs on a console session, not behind
+  a page a non-technical operator drives unsupervised.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Survey Export</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.3rem; }
+  section { margin-bottom: 1.5rem; padding: 1rem; border: 1px solid #8888; border-radius: 0.5rem; }
+  button { font-size: 1rem; padding: 0.5rem 1rem; cursor: pointer; }
+  button:disabled { cursor: default; opacity: 0.5; }
+  select { font-size: 1rem; padding: 0.3rem; }
+  progress { width: 100%; height: 1.2rem; }
+  #log { font-family: ui-monospace, monospace; font-size: 0.85rem; white-space: pre-wrap;
+         max-height: 12rem; overflow-y: auto; background: #8881; border-radius: 0.3rem;
+         padding: 0.5rem; }
+  .status { font-weight: 600; }
+  .error { color: #c0392b; }
+  .ok { color: #27ae60; }
+</style>
+</head>
+<body>
+
+<h1>Thingy:91 X Survey Export</h1>
+<p>Connects to the device over USB and downloads the stored radio-survey records to a file on
+this computer. Nothing is deleted from the device.</p>
+
+<section id="unsupported" hidden>
+  <p class="error"><strong>This browser does not support Web Serial.</strong> Open this page
+  in Chrome or Edge.</p>
+</section>
+
+<section id="connect-section">
+  <p>
+    <label for="transport">Port</label>
+    <select id="transport">
+      <option value="1000000">Dedicated export port (1,000,000 baud) -- use this one</option>
+      <option value="115200">Shell port (115,200 baud) -- fallback if the export port is not enumerated</option>
+    </select>
+  </p>
+  <button id="connect-btn">Connect</button>
+  <button id="disconnect-btn" disabled>Disconnect</button>
+  <p class="status" id="conn-status">Not connected.</p>
+</section>
+
+<section id="export-section">
+  <button id="export-btn" disabled>Start Export</button>
+  <p><progress id="progress" value="0" max="1" hidden></progress></p>
+  <p class="status" id="export-status"></p>
+</section>
+
+<section>
+  <p><strong>Log</strong></p>
+  <div id="log"></div>
+</section>
+
+<script>
+"use strict";
+
+class SmpError extends Error {}
+class ExportError extends Error {}
+
+const FRAME_START = new Uint8Array([0x06, 0x09]);
+const FRAME_CONT = new Uint8Array([0x04, 0x14]);
+const FRAME_MAX = 127;
+
+const OP_READ = 0;
+const GROUP_FS = 8;
+const CMD_FS_FILE = 0;
+const CMD_FS_STATUS = 1;
+const CMD_FS_CHECKSUM = 2;
+
+const MOUNT_POINT = "/att_storage";
+const STORAGE_TYPE = "SURVEY";
+// Mirrors app/src/modules/survey/survey_store.h and app/overlay-survey.conf, the same
+// constants scripts/survey_export.py duplicates for the same reason: fs_mgmt has no
+// "describe your layout" command.
+const SLOT_SIZE = 816;
+const RECORDS_PER_TYPE = 25000;
+const ENTRIES_PER_BLOCK = Math.floor(4096 / SLOT_SIZE);
+
+// --- byte helpers -----------------------------------------------------------------------
+
+function concatBytes(...parts) {
+  const total = parts.reduce((sum, p) => sum + p.length, 0);
+  const out = new Uint8Array(total);
+  let pos = 0;
+  for (const part of parts) {
+    out.set(part, pos);
+    pos += part.length;
+  }
+  return out;
+}
+
+function bytesEqual(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function startsWith(bytes, prefix) {
+  return bytesEqual(bytes.slice(0, prefix.length), prefix);
+}
+
+const BASE64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+function bytesToBase64(bytes) {
+  let out = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i], b1 = bytes[i + 1], b2 = bytes[i + 2];
+    out += BASE64_CHARS[b0 >> 2];
+    out += BASE64_CHARS[((b0 & 0x03) << 4) | (b1 === undefined ? 0 : b1 >> 4)];
+    out += b1 === undefined ? "=" : BASE64_CHARS[((b1 & 0x0f) << 2) | (b2 === undefined ? 0 : b2 >> 6)];
+    out += b2 === undefined ? "=" : BASE64_CHARS[b2 & 0x3f];
+  }
+  return out;
+}
+
+function base64ToBytes(text) {
+  const clean = text.replace(/=+$/, "");
+  const out = new Uint8Array(Math.floor((clean.length * 6) / 8));
+  let bitBuffer = 0, bitCount = 0, outPos = 0;
+  for (const ch of clean) {
+    const value = BASE64_CHARS.indexOf(ch);
+    if (value === -1) throw new SmpError(`invalid base64 character ${JSON.stringify(ch)}`);
+    bitBuffer = (bitBuffer << 6) | value;
+    bitCount += 6;
+    if (bitCount >= 8) {
+      bitCount -= 8;
+      out[outPos++] = (bitBuffer >> bitCount) & 0xff;
+    }
+  }
+  return out;
+}
+
+// --- SMP serial framing (matches scripts/survey_smp.py) --------------------------------
+
+function crc16Xmodem(data) {
+  let crc = 0;
+  for (const byte of data) {
+    crc ^= byte << 8;
+    for (let i = 0; i < 8; i++) {
+      crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) & 0xffff : (crc << 1) & 0xffff;
+    }
+  }
+  return crc;
+}
+
+function encodeFrames(packet) {
+  const bodyLen = packet.length + 2;
+  const lenPrefix = new Uint8Array([(bodyLen >> 8) & 0xff, bodyLen & 0xff]);
+  const crc = crc16Xmodem(packet);
+  const crcBytes = new Uint8Array([(crc >> 8) & 0xff, crc & 0xff]);
+  const encoded = new TextEncoder().encode(bytesToBase64(concatBytes(lenPrefix, packet, crcBytes)));
+
+  const frames = [];
+  let marker = FRAME_START;
+  let pos = 0;
+  const room = Math.floor((FRAME_MAX - 3) / 4) * 4;
+  while (pos < encoded.length) {
+    const chunk = encoded.slice(pos, pos + room);
+    frames.push(concatBytes(marker, chunk, new Uint8Array([10])));
+    marker = FRAME_CONT;
+    pos += chunk.length;
+  }
+  return frames;
+}
+
+function decodeFrames(lines) {
+  let encoded = "";
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const marker = line.slice(0, 2);
+    const expected = i === 0 ? FRAME_START : FRAME_CONT;
+    if (!bytesEqual(marker, expected)) {
+      throw new SmpError(`frame ${i} has an unexpected marker`);
+    }
+    encoded += new TextDecoder().decode(line.slice(2)).trim();
+  }
+
+  const body = base64ToBytes(encoded);
+  if (body.length < 4) {
+    throw new SmpError(`reassembled body is ${body.length} bytes, too short to carry a CRC`);
+  }
+  const declared = (body[0] << 8) | body[1];
+  const payload = body.slice(2);
+  if (declared !== payload.length) {
+    throw new SmpError(`length prefix says ${declared} bytes, got ${payload.length}`);
+  }
+  const packet = payload.slice(0, payload.length - 2);
+  const crc = (payload[payload.length - 2] << 8) | payload[payload.length - 1];
+  const actual = crc16Xmodem(packet);
+  if (crc !== actual) {
+    throw new SmpError(`CRC mismatch: frame says ${crc.toString(16)}, computed ${actual.toString(16)}`);
+  }
+  return packet;
+}
+
+function buildPacket(op, group, command, sequence, payload) {
+  const header = new Uint8Array([
+    op, 0,
+    (payload.length >> 8) & 0xff, payload.length & 0xff,
+    (group >> 8) & 0xff, group & 0xff,
+    sequence & 0xff, command & 0xff,
+  ]);
+  return concatBytes(header, payload);
+}
+
+function parsePacket(packet) {
+  if (packet.length < 8) {
+    throw new SmpError(`packet is ${packet.length} bytes, shorter than an SMP header`);
+  }
+  const op = packet[0];
+  const length = (packet[2] << 8) | packet[3];
+  const group = (packet[4] << 8) | packet[5];
+  const sequence = packet[6];
+  const command = packet[7];
+  const payload = packet.slice(8);
+  if (length !== payload.length) {
+    throw new SmpError(`header declares ${length} payload bytes, got ${payload.length}`);
+  }
+  return { op, group, sequence, command, payload };
+}
+
+// --- minimal fs_mgmt CBOR (matches scripts/survey_smp.py) ------------------------------
+
+function cborEncodeUint(value) {
+  if (value < 24) return new Uint8Array([value]);
+  if (value < 256) return new Uint8Array([24, value]);
+  if (value < 65536) return new Uint8Array([25, (value >> 8) & 0xff, value & 0xff]);
+  if (value < 2 ** 32) {
+    return new Uint8Array([
+      26, (value >>> 24) & 0xff, (value >>> 16) & 0xff, (value >>> 8) & 0xff, value & 0xff,
+    ]);
+  }
+  const out = new Uint8Array(9);
+  out[0] = 27;
+  let remaining = value;
+  for (let i = 8; i >= 1; i--) {
+    out[i] = remaining % 256;
+    remaining = Math.floor(remaining / 256);
+  }
+  return out;
+}
+
+function cborEncodeHead(major, value) {
+  const head = cborEncodeUint(value);
+  const out = head.slice();
+  out[0] = (major << 5) | head[0];
+  return out;
+}
+
+function cborEncodeMap(fields) {
+  const entries = Object.entries(fields);
+  const parts = [cborEncodeHead(5, entries.length)];
+  for (const [key, value] of entries) {
+    const keyBytes = new TextEncoder().encode(key);
+    parts.push(cborEncodeHead(3, keyBytes.length), keyBytes);
+    if (typeof value === "string") {
+      const valueBytes = new TextEncoder().encode(value);
+      parts.push(cborEncodeHead(3, valueBytes.length), valueBytes);
+    } else if (value instanceof Uint8Array) {
+      parts.push(cborEncodeHead(2, value.length), value);
+    } else if (typeof value === "number") {
+      parts.push(cborEncodeHead(0, value));
+    } else {
+      throw new TypeError(`unsupported CBOR value type for key ${key}`);
+    }
+  }
+  return concatBytes(...parts);
+}
+
+function cborDecodeItem(data, pos) {
+  const initial = data[pos];
+  const major = initial >> 5;
+  const minor = initial & 0x1f;
+  pos += 1;
+
+  let arg;
+  if (minor < 24) {
+    arg = minor;
+  } else if (minor >= 24 && minor <= 27) {
+    const width = 1 << (minor - 24);
+    arg = 0;
+    for (let i = 0; i < width; i++) arg = arg * 256 + data[pos + i];
+    if (width === 8 && !Number.isSafeInteger(arg)) {
+      throw new SmpError(`CBOR uint at offset ${pos} exceeds what this decoder represents exactly`);
+    }
+    pos += width;
+  } else {
+    throw new SmpError(`unsupported CBOR additional-information ${minor} at offset ${pos - 1}`);
+  }
+
+  if (major === 0) return [arg, pos];
+  if (major === 2) return [data.slice(pos, pos + arg), pos + arg];
+  if (major === 3) return [new TextDecoder().decode(data.slice(pos, pos + arg)), pos + arg];
+  if (major === 5) {
+    const result = {};
+    for (let i = 0; i < arg; i++) {
+      const [key, keyPos] = cborDecodeItem(data, pos);
+      pos = keyPos;
+      if (typeof key !== "string") throw new SmpError(`map key at offset ${pos} is not a text string`);
+      const [value, valuePos] = cborDecodeItem(data, pos);
+      pos = valuePos;
+      result[key] = value;
+    }
+    return [result, pos];
+  }
+  throw new SmpError(`unsupported CBOR major type ${major} in an fs_mgmt response`);
+}
+
+function cborDecodeMap(data) {
+  const [value, pos] = cborDecodeItem(data, 0);
+  if (typeof value !== "object" || value instanceof Uint8Array) {
+    throw new SmpError("expected a CBOR map at the top level");
+  }
+  if (pos !== data.length) {
+    throw new SmpError(`${data.length - pos} trailing byte(s) after the top-level map`);
+  }
+  return value;
+}
+
+function checkRc(response, context) {
+  if (typeof response.rc === "number" && response.rc !== 0) {
+    throw new SmpError(`${context}: device returned rc=${response.rc}`);
+  }
+}
+
+// --- transport: one SMP session over a Web Serial port ---------------------------------
+
+class SmpTransport {
+  constructor(port) {
+    this.port = port;
+    this.buffer = new Uint8Array(0);
+    this.sequence = 0;
+  }
+
+  async open(baudRate) {
+    await this.port.open({ baudRate });
+    this.writer = this.port.writable.getWriter();
+    this.reader = this.port.readable.getReader();
+  }
+
+  async close() {
+    try { await this.reader.cancel(); } catch (_) { /* already closed */ }
+    try { this.reader.releaseLock(); } catch (_) { /* already released */ }
+    try { this.writer.releaseLock(); } catch (_) { /* already released */ }
+    try { await this.port.close(); } catch (_) { /* already closed */ }
+  }
+
+  nextSequence() {
+    const sequence = this.sequence;
+    this.sequence = (this.sequence + 1) % 256;
+    return sequence;
+  }
+
+  async readLine() {
+    while (true) {
+      const idx = this.buffer.indexOf(10);
+      if (idx !== -1) {
+        const line = this.buffer.slice(0, idx + 1);
+        this.buffer = this.buffer.slice(idx + 1);
+        return line;
+      }
+      const { value, done } = await this.reader.read();
+      if (done) return null;
+      if (value && value.length) this.buffer = concatBytes(this.buffer, value);
+    }
+  }
+
+  // A timeout here is treated as fatal to the session rather than recoverable: the
+  // reader.read() it leaves pending cannot be safely raced again on the next request, so
+  // the caller is expected to reconnect rather than retry.
+  async request(op, group, command, payload, timeoutMs = 8000) {
+    const sequence = this.nextSequence();
+    const packet = buildPacket(op, group, command, sequence, payload);
+    for (const frame of encodeFrames(packet)) {
+      await this.writer.write(frame);
+    }
+
+    const collectResponse = async () => {
+      let collected = [];
+      while (true) {
+        const line = await this.readLine();
+        if (line === null) {
+          throw new SmpError(`port closed waiting for a response to group ${group} command ${command}`);
+        }
+        if (collected.length === 0) {
+          if (!startsWith(line, FRAME_START)) continue; // shell noise, not our response
+          collected = [line];
+        } else {
+          collected.push(line);
+        }
+
+        let response;
+        try {
+          response = parsePacket(decodeFrames(collected));
+        } catch (_) {
+          if (startsWith(collected[collected.length - 1], FRAME_CONT) || collected.length === 1) {
+            continue;
+          }
+          collected = [];
+          continue;
+        }
+
+        if (response.sequence !== sequence) {
+          collected = [];
+          continue;
+        }
+        return response;
+      }
+    };
+
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(
+        () => reject(new SmpError(`timed out waiting for a response to group ${group} command ${command}`)),
+        timeoutMs
+      );
+    });
+    try {
+      return await Promise.race([collectResponse(), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
+// --- fs_mgmt group commands (matches FsMgmt in scripts/survey_smp.py) -------------------
+
+class FsMgmt {
+  constructor(transport) {
+    this.transport = transport;
+  }
+
+  async stat(path) {
+    const request = cborEncodeMap({ name: path });
+    const response = await this.transport.request(OP_READ, GROUP_FS, CMD_FS_STATUS, request);
+    const result = cborDecodeMap(response.payload);
+    checkRc(result, `fs stat ${path}`);
+    if (typeof result.len !== "number") throw new SmpError(`fs stat ${path}: response has no numeric 'len'`);
+    return result.len;
+  }
+
+  async checksumCrc32(path) {
+    const request = cborEncodeMap({ name: path, type: "crc32" });
+    const response = await this.transport.request(OP_READ, GROUP_FS, CMD_FS_CHECKSUM, request);
+    const result = cborDecodeMap(response.payload);
+    checkRc(result, `fs checksum ${path}`);
+    if (typeof result.output !== "number") throw new SmpError(`fs checksum ${path}: response has no numeric 'output'`);
+    return result.output;
+  }
+
+  async download(path) {
+    const chunks = [];
+    let offset = 0;
+    let total = null;
+
+    while (total === null || offset < total) {
+      const request = cborEncodeMap({ name: path, off: offset });
+      const response = await this.transport.request(OP_READ, GROUP_FS, CMD_FS_FILE, request);
+      const result = cborDecodeMap(response.payload);
+      checkRc(result, `fs download ${path} at offset ${offset}`);
+
+      const data = result.data;
+      if (!(data instanceof Uint8Array)) throw new SmpError(`fs download ${path}: response has no byte-string 'data'`);
+
+      if (offset === 0) {
+        if (typeof result.len !== "number") throw new SmpError(`fs download ${path}: first response has no numeric 'len'`);
+        total = result.len;
+      }
+
+      if (data.length === 0 && offset < total) {
+        throw new SmpError(`fs download ${path}: empty chunk at offset ${offset} of ${total}`);
+      }
+
+      chunks.push(data);
+      offset += data.length;
+    }
+    return concatBytes(...chunks);
+  }
+}
+
+// --- CRC32 (IEEE, zlib-compatible -- matches Zephyr's crc32_ieee()) ---------------------
+
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    table[n] = c;
+  }
+  return table;
+})();
+
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) crc = CRC32_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+// --- ring-buffer export (matches scripts/survey_export.py) -----------------------------
+
+function pathForFileIndex(fileIndex) {
+  return `${MOUNT_POINT}/${STORAGE_TYPE}_${fileIndex}.bin`;
+}
+
+async function readHeader(fs) {
+  const data = await fs.download(`${MOUNT_POINT}/${STORAGE_TYPE}.header`);
+  if (data.length !== 8) throw new ExportError(`SURVEY.header is ${data.length} bytes, expected 8`);
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const readOffset = view.getUint32(0, true);
+  const writeOffset = view.getUint32(4, true);
+  if (writeOffset < readOffset) {
+    throw new ExportError(
+      `SURVEY.header has write_offset=${writeOffset} < read_offset=${readOffset} -- header looks corrupt, not just empty`
+    );
+  }
+  return [readOffset, writeOffset];
+}
+
+async function verifiedDownload(fs, path) {
+  const data = await fs.download(path);
+  const expected = await fs.checksumCrc32(path);
+  const actual = crc32(data);
+  if (actual !== expected) {
+    throw new ExportError(
+      `${path}: CRC32 mismatch after download (device says 0x${expected.toString(16)}, computed 0x${actual.toString(16)})`
+    );
+  }
+  return data;
+}
+
+function slotToRecord(slot) {
+  if (slot.length < 4) throw new ExportError(`slot is ${slot.length} bytes, too short to carry a length prefix`);
+  const length = new DataView(slot.buffer, slot.byteOffset, 4).getUint32(0, true);
+  if (length === 0 || length > slot.length - 4) {
+    throw new ExportError(`slot declares length ${length}, which does not fit a ${slot.length}-byte slot`);
+  }
+  return slot.slice(4, 4 + length);
+}
+
+// Downloads (and CRC-verifies) each data file once, caching the current file's bytes across
+// consecutive ring indices that land in it -- the same arithmetic survey_export.py's
+// iter_live_slots duplicates from the backend, because fs_mgmt has no indexed read.
+async function runExport(fs, onProgress) {
+  const [readOffset, writeOffset] = await readHeader(fs);
+  const total = writeOffset - readOffset;
+  const chunks = [];
+  const failures = [];
+  let seen = 0;
+  let written = 0;
+  let cachedIndex = null;
+  let cachedBytes = null;
+
+  for (let index = readOffset; index < writeOffset; index++) {
+    const wrapped = index % RECORDS_PER_TYPE;
+    const fileIndex = Math.floor(wrapped / ENTRIES_PER_BLOCK);
+    const slotIndex = wrapped % ENTRIES_PER_BLOCK;
+
+    if (fileIndex !== cachedIndex) {
+      cachedBytes = await verifiedDownload(fs, pathForFileIndex(fileIndex));
+      cachedIndex = fileIndex;
+    }
+
+    const start = slotIndex * SLOT_SIZE;
+    const slot = cachedBytes.slice(start, start + SLOT_SIZE);
+    seen++;
+    try {
+      const record = slotToRecord(slot);
+      const lengthPrefix = new Uint8Array(4);
+      new DataView(lengthPrefix.buffer).setUint32(0, record.length, true);
+      chunks.push(lengthPrefix, record);
+      written++;
+    } catch (err) {
+      failures.push(`record at ring index ${index}: ${err.message}`);
+    }
+    onProgress(seen, total, written);
+  }
+
+  return { data: concatBytes(...chunks), seen, written, total, failures };
+}
+
+// --- UI wiring ---------------------------------------------------------------------------
+
+const logEl = document.getElementById("log");
+function log(message, cls) {
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = message;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+const connectBtn = document.getElementById("connect-btn");
+const disconnectBtn = document.getElementById("disconnect-btn");
+const exportBtn = document.getElementById("export-btn");
+const transportSelect = document.getElementById("transport");
+const connStatus = document.getElementById("conn-status");
+const exportStatus = document.getElementById("export-status");
+const progressEl = document.getElementById("progress");
+
+let transport = null;
+let fs = null;
+
+if (!("serial" in navigator)) {
+  document.getElementById("unsupported").hidden = false;
+  connectBtn.disabled = true;
+}
+
+connectBtn.addEventListener("click", async () => {
+  try {
+    const port = await navigator.serial.requestPort();
+    transport = new SmpTransport(port);
+    await transport.open(Number(transportSelect.value));
+    fs = new FsMgmt(transport);
+
+    connStatus.textContent = "Connected. Checking record count...";
+    connStatus.className = "status";
+    connectBtn.disabled = true;
+    disconnectBtn.disabled = false;
+
+    const [readOffset, writeOffset] = await readHeader(fs);
+    const liveRecords = writeOffset - readOffset;
+    connStatus.textContent = `Connected. ${liveRecords} record(s) stored on the device.`;
+    exportBtn.disabled = liveRecords === 0;
+    if (liveRecords === 0) exportStatus.textContent = "Nothing to export.";
+    log(`connected: ${liveRecords} live record(s) (read_offset=${readOffset}, write_offset=${writeOffset})`, "ok");
+  } catch (err) {
+    connStatus.textContent = `Connection failed: ${err.message}`;
+    connStatus.className = "status error";
+    log(`connect failed: ${err.message}`, "error");
+    if (transport) { await transport.close().catch(() => {}); transport = null; fs = null; }
+    connectBtn.disabled = false;
+    disconnectBtn.disabled = true;
+    exportBtn.disabled = true;
+  }
+});
+
+disconnectBtn.addEventListener("click", async () => {
+  if (transport) await transport.close().catch(() => {});
+  transport = null;
+  fs = null;
+  connectBtn.disabled = false;
+  disconnectBtn.disabled = true;
+  exportBtn.disabled = true;
+  connStatus.textContent = "Not connected.";
+  connStatus.className = "status";
+  log("disconnected");
+});
+
+exportBtn.addEventListener("click", async () => {
+  exportBtn.disabled = true;
+  disconnectBtn.disabled = true; // closing the transport mid-export would race its pending read/write
+  progressEl.hidden = false;
+  progressEl.value = 0;
+  exportStatus.textContent = "Exporting...";
+  exportStatus.className = "status";
+
+  try {
+    const result = await runExport(fs, (seen, total, written) => {
+      progressEl.max = total || 1;
+      progressEl.value = seen;
+      exportStatus.textContent = `Exporting: ${seen}/${total} record(s) read, ${written} written.`;
+    });
+
+    for (const failure of result.failures) log(failure, "error");
+
+    const blob = new Blob([result.data], { type: "application/octet-stream" });
+    const url = URL.createObjectURL(blob);
+    const filename = `survey_export_${new Date().toISOString().replace(/[:.]/g, "-")}.bin`;
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+
+    const failureNote = result.failures.length ? `, ${result.failures.length} record(s) failed (see log)` : "";
+    exportStatus.textContent = `Done: ${result.written}/${result.seen} record(s) exported to ${filename}${failureNote}.`;
+    exportStatus.className = result.failures.length ? "status error" : "status ok";
+    log(`export complete: seen=${result.seen} written=${result.written} failed=${result.failures.length}`, "ok");
+  } catch (err) {
+    exportStatus.textContent = `Export failed: ${err.message}`;
+    exportStatus.className = "status error";
+    log(`export failed: ${err.message}`, "error");
+  } finally {
+    exportBtn.disabled = false;
+    disconnectBtn.disabled = !transport;
+  }
+});
+</script>
+
+</body>
+</html>
