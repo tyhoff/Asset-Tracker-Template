@@ -296,6 +296,72 @@ function cborDecodeItem(data, pos) {
   const minor = initial & 0x1f;
   pos += 1;
 
+  // zcbor (mcumgr's own CBOR encoder, on the firmware side) encodes maps and strings whose
+  // final size is not known up front as indefinite-length: an open head with minor===31,
+  // a run of items, then a lone 0xFF "break" byte instead of a length. Real fs_mgmt responses
+  // come back this way -- even though every map this client itself *sends* is definite-length,
+  // so encoding never needs this, only decoding does.
+  if (minor === 31 && (major === 2 || major === 3 || major === 4 || major === 5)) {
+    if (pos >= data.length) {
+      throw new SmpError(`indefinite-length item at offset ${pos - 1} runs past the end of the response`);
+    }
+    if (major === 2) {
+      const chunks = [];
+      while (data[pos] !== 0xff) {
+        if (pos >= data.length) {
+          throw new SmpError(`indefinite byte string at offset ${pos} is missing its break byte`);
+        }
+        const [chunk, chunkPos] = cborDecodeItem(data, pos);
+        if (!(chunk instanceof Uint8Array)) {
+          throw new SmpError(`indefinite byte string chunk at offset ${pos} is not bytes`);
+        }
+        chunks.push(chunk);
+        pos = chunkPos;
+      }
+      return [concatBytes(...chunks), pos + 1];
+    }
+    if (major === 3) {
+      const parts = [];
+      while (data[pos] !== 0xff) {
+        if (pos >= data.length) {
+          throw new SmpError(`indefinite text string at offset ${pos} is missing its break byte`);
+        }
+        const [chunk, chunkPos] = cborDecodeItem(data, pos);
+        if (typeof chunk !== "string") {
+          throw new SmpError(`indefinite text string chunk at offset ${pos} is not text`);
+        }
+        parts.push(chunk);
+        pos = chunkPos;
+      }
+      return [parts.join(""), pos + 1];
+    }
+    if (major === 4) {
+      const items = [];
+      while (data[pos] !== 0xff) {
+        if (pos >= data.length) {
+          throw new SmpError(`indefinite array at offset ${pos} is missing its break byte`);
+        }
+        const [item, itemPos] = cborDecodeItem(data, pos);
+        items.push(item);
+        pos = itemPos;
+      }
+      return [items, pos + 1];
+    }
+    const result = {};
+    while (data[pos] !== 0xff) {
+      if (pos >= data.length) {
+        throw new SmpError(`indefinite map at offset ${pos} is missing its break byte`);
+      }
+      const [key, keyPos] = cborDecodeItem(data, pos);
+      pos = keyPos;
+      if (typeof key !== "string") throw new SmpError(`map key at offset ${pos} is not a text string`);
+      const [value, valuePos] = cborDecodeItem(data, pos);
+      pos = valuePos;
+      result[key] = value;
+    }
+    return [result, pos + 1];
+  }
+
   let arg;
   if (minor < 24) {
     arg = minor;
@@ -628,9 +694,15 @@ if (!("serial" in navigator)) {
   connectBtn.disabled = true;
 }
 
+// Nordic Semiconductor's USB vendor ID (0x1915), confirmed against the connected Thingy:91 X
+// (`ioreg -p IOUSB -l` reports idVendor=6421). Without this filter, requestPort()'s native
+// chooser lists every serial-capable device on the machine -- Bluetooth-serial AirPods and
+// mice included, on macOS -- which defeats the point of a picker for a non-technical operator.
+const USB_VENDOR_FILTER = [{ usbVendorId: 0x1915 }];
+
 connectBtn.addEventListener("click", async () => {
   try {
-    const port = await navigator.serial.requestPort();
+    const port = await navigator.serial.requestPort({ filters: USB_VENDOR_FILTER });
     transport = new SmpTransport(port);
     await transport.open(Number(transportSelect.value));
     fs = new FsMgmt(transport);

@@ -279,11 +279,54 @@ def cbor_encode_map(fields: dict[str, CborScalar]) -> bytes:
     return out
 
 
-def _cbor_decode_item(data: bytes, pos: int) -> tuple[CborScalar | dict, int]:
+def _cbor_decode_item(data: bytes, pos: int) -> tuple[CborScalar | dict | list, int]:
     initial = data[pos]
     major = initial >> 5
     minor = initial & 0x1F
     pos += 1
+
+    # zcbor (mcumgr's own CBOR encoder, on the firmware side) encodes maps and strings whose
+    # final size is not known up front as indefinite-length: an open head with minor==31,
+    # a run of items, then a lone 0xFF "break" byte instead of a length. fs_mgmt responses
+    # come back this way in practice, even though every map this client itself *sends* is
+    # definite-length -- so decoding has to handle both, even though encoding never needs to.
+    if minor == 31 and major in (2, 3, 4, 5):
+        def at_break(pos: int) -> bool:
+            if pos >= len(data):
+                raise SmpError(f"indefinite-length item is missing its break byte "
+                                f"(ran off the end of a {len(data)}-byte response)")
+            return data[pos] == 0xFF
+
+        if major == 2:
+            chunks = bytearray()
+            while not at_break(pos):
+                chunk, pos = _cbor_decode_item(data, pos)
+                if not isinstance(chunk, bytes):
+                    raise SmpError(f"indefinite byte string chunk at offset {pos} is not bytes")
+                chunks += chunk
+            return bytes(chunks), pos + 1
+        if major == 3:
+            text_parts = []
+            while not at_break(pos):
+                chunk, pos = _cbor_decode_item(data, pos)
+                if not isinstance(chunk, str):
+                    raise SmpError(f"indefinite text string chunk at offset {pos} is not text")
+                text_parts.append(chunk)
+            return "".join(text_parts), pos + 1
+        if major == 4:
+            items: list = []
+            while not at_break(pos):
+                item, pos = _cbor_decode_item(data, pos)
+                items.append(item)
+            return items, pos + 1
+        result: dict[str, CborScalar] = {}
+        while not at_break(pos):
+            key, pos = _cbor_decode_item(data, pos)
+            if not isinstance(key, str):
+                raise SmpError(f"map key at offset {pos} is not a text string")
+            value, pos = _cbor_decode_item(data, pos)
+            result[key] = value
+        return result, pos + 1
 
     if minor < 24:
         arg = minor

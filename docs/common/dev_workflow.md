@@ -828,6 +828,14 @@ decoder above. Bare `python3 -m pip install pyserial` on this machine hits a PEP
 externally-managed-environment error; pulling `import serial` down into the one place that actually
 opens a port avoided needing to fight that just to run the host test suite.
 
+That deferred import only fixes the *test suite* — it does not make `scripts/survey_export.py`
+runnable against a real port, since that script's whole job is to open one. For that,
+`survey_export.py` carries PEP 723 inline script metadata (a `# /// script ... dependencies =
+["pyserial"] ... ///` block right after the shebang), so `uv run scripts/survey_export.py --port
+... --baud ... out.bin` provisions pyserial into an isolated environment on first run — no
+system-Python fight, no toolchain-manager detour. Confirmed against a real Thingy:91 X on
+`/dev/cu.usbmodem105`.
+
 ## Hardware integration tests
 
 `tests/hardware/survey_hwtest.py` drives the console and asserts on the replies, so the on-target

@@ -1,10 +1,24 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
 #
 # Copyright (c) 2026 Nordic Semiconductor ASA
 #
 # SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
 
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "pyserial==3.5",
+# ]
+# ///
+
 """Export stored survey records off a Thingy:91 X over MCUmgr fs_mgmt (CP8 / FW-8).
+
+Run with `uv run scripts/survey_export.py ...` (or just `./scripts/survey_export.py ...` once
+executable) -- uv reads the dependency block above and provisions pyserial into an isolated
+environment on first run, so there is no system-Python pip install to fight (this machine's
+Python is externally managed; see docs/common/dev_workflow.md). A bare `python3
+scripts/survey_export.py` still works if pyserial happens to already be on the path (e.g.
+inside `nrfutil toolchain-manager launch`); it just does not provision anything for you.
 
 This is the technical fallback for CP9's browser page: when Web Serial or the page itself
 is unavailable, this is "run this script" instead of "wait for a fix". It walks the same
