@@ -33,6 +33,7 @@ Examples:
 import argparse
 import json
 import re
+import struct
 import sys
 from typing import Any, Optional, Sequence, Union
 
@@ -556,6 +557,34 @@ _HEX_BLOCK = re.compile(
 )
 
 
+def records_from_length_prefixed_stream(data: bytes) -> list[bytes]:
+    """Split a CP8 export (scripts/survey_export.py) into its individual CBOR records.
+
+    Each record is a 4-byte little-endian length followed by that many bytes of CBOR,
+    packed tightly with no padding between records -- the format survey_export.py writes
+    after stripping the on-flash slot padding. A short trailing length prefix (fewer than 4
+    bytes left) is reported rather than silently ignored, since it means the file was cut
+    off mid-write rather than ending cleanly on a record boundary.
+    """
+    out = []
+    pos = 0
+    while pos < len(data):
+        if len(data) - pos < 4:
+            raise ValueError(
+                f"{len(data) - pos} byte(s) left at offset {pos}, too few for a length prefix"
+            )
+        (length,) = struct.unpack_from("<I", data, pos)
+        pos += 4
+        if length == 0 or pos + length > len(data):
+            raise ValueError(
+                f"record at offset {pos - 4} declares length {length}, which does not fit "
+                f"the remaining {len(data) - pos} byte(s)"
+            )
+        out.append(data[pos : pos + length])
+        pos += length
+    return out
+
+
 def records_from_hex_capture(text: str) -> list[bytes]:
     """Extract records from a console capture containing "survey hex" output.
 
@@ -603,9 +632,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 1
     else:
         raw = sys.stdin.buffer.read() if args.input == "-" else open(args.input, "rb").read()
-        # Without the CP8 export framing there is no length prefix to split on, so a
-        # bare binary input is treated as exactly one record.
-        blobs = [raw]
+        # A CP8 export (scripts/survey_export.py) is a tightly packed stream of
+        # length-prefixed CBOR records; a bare CBOR record with no such framing looks like
+        # a stream of exactly one entry whose declared length is short of the buffer, which
+        # records_from_length_prefixed_stream raises on rather than silently truncating.
+        try:
+            blobs = records_from_length_prefixed_stream(raw)
+        except ValueError as err:
+            print(f"could not read binary export: {err}", file=sys.stderr)
+            return 1
 
     gate = Gate(
         max_acc_m=args.max_acc,

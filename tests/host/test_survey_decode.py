@@ -21,6 +21,7 @@ Run with:  python3 -m unittest discover -s tests/host
 
 import json
 import pathlib
+import struct
 import sys
 import unittest
 
@@ -34,6 +35,7 @@ from survey_decode import (  # noqa: E402
     decode_session,
     interpolate,
     records_from_hex_capture,
+    records_from_length_prefixed_stream,
     rsrp_idx_to_dbm,
     rsrq_idx_to_db,
     wifi_frequency_mhz,
@@ -344,6 +346,31 @@ class TestHexCapture(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             records_from_hex_capture(capture)
+
+
+class TestLengthPrefixedStream(unittest.TestCase):
+    """CP8's export framing: scripts/survey_export.py's binary output."""
+
+    def test_splits_multiple_records(self) -> None:
+        blob = load_fixture("record")
+        stream = struct.pack("<I", len(blob)) + blob + struct.pack("<I", len(blob)) + blob
+        found = records_from_length_prefixed_stream(stream)
+        self.assertEqual(found, [blob, blob])
+
+    def test_empty_stream_is_zero_records(self) -> None:
+        self.assertEqual(records_from_length_prefixed_stream(b""), [])
+
+    def test_short_length_prefix_is_an_error(self) -> None:
+        with self.assertRaises(ValueError):
+            records_from_length_prefixed_stream(b"\x01\x02\x03")
+
+    def test_declared_length_past_end_of_buffer_is_an_error(self) -> None:
+        with self.assertRaises(ValueError):
+            records_from_length_prefixed_stream(struct.pack("<I", 100) + b"short")
+
+    def test_zero_length_record_is_an_error(self) -> None:
+        with self.assertRaises(ValueError):
+            records_from_length_prefixed_stream(struct.pack("<I", 0))
 
 
 class TestMalformedInput(unittest.TestCase):

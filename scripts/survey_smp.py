@@ -23,9 +23,12 @@ from __future__ import annotations
 import base64
 import struct
 from dataclasses import dataclass
-from typing import Final
+from typing import TYPE_CHECKING, Final, Union
 
-import serial
+if TYPE_CHECKING:
+    import serial
+
+CborScalar = Union[int, str, bytes]
 
 # Serial framing markers, from Zephyr's smp_transport spec.
 FRAME_START: Final[bytes] = b"\x06\x09"
@@ -167,7 +170,13 @@ class SmpSerial:
     """
 
     def __init__(self, port: str, baudrate: int, timeout: float = 5.0) -> None:
-        self.ser: serial.Serial = serial.Serial(port, baudrate, timeout=timeout)
+        # Deferred so that everything else in this module -- the framing, the fs_mgmt CBOR
+        # encode/decode, and FsMgmt driven by a fake in place of a real SmpSerial -- stays
+        # importable and unit-testable without pyserial installed, matching tests/host's
+        # no-third-party-dependencies policy. Only opening a real port needs it.
+        import serial
+
+        self.ser: "serial.Serial" = serial.Serial(port, baudrate, timeout=timeout)
         self._sequence: int = 0
 
     def close(self) -> None:
@@ -223,3 +232,165 @@ class SmpSerial:
                 collected = []
                 continue
             return response
+
+
+# --- Minimal CBOR for fs_mgmt request/response maps ---------------------------------------
+#
+# fs_mgmt's own maps are shallow: text-string keys, and values that are only unsigned
+# integers, text strings or byte strings. A general decoder (survey_decode.py already has
+# one, for the record schema) would be the wrong tool here -- it would accept containers
+# and negative integers that fs_mgmt never sends, silently widening what this client treats
+# as well-formed.
+
+
+def _cbor_encode_uint(value: int) -> bytes:
+    if value < 24:
+        return bytes([value])
+    if value < 256:
+        return bytes([24, value])
+    if value < 65536:
+        return bytes([25]) + struct.pack(">H", value)
+    if value < 2**32:
+        return bytes([26]) + struct.pack(">I", value)
+    return bytes([27]) + struct.pack(">Q", value)
+
+
+def _cbor_encode_head(major: int, value: int) -> bytes:
+    """Encode a head for a major type whose argument is a length or a uint value."""
+    head = _cbor_encode_uint(value)
+    return bytes([(major << 5) | head[0]]) + head[1:]
+
+
+def cbor_encode_map(fields: dict[str, CborScalar]) -> bytes:
+    """Encode a definite-length map with text-string keys, matching what fs_mgmt decodes."""
+    out = _cbor_encode_head(5, len(fields))
+    for key, value in fields.items():
+        key_bytes = key.encode("utf-8")
+        out += _cbor_encode_head(3, len(key_bytes)) + key_bytes
+        if isinstance(value, str):
+            value_bytes = value.encode("utf-8")
+            out += _cbor_encode_head(3, len(value_bytes)) + value_bytes
+        elif isinstance(value, bytes):
+            out += _cbor_encode_head(2, len(value)) + value
+        elif isinstance(value, int):
+            out += _cbor_encode_head(0, value)
+        else:
+            raise TypeError(f"unsupported CBOR value type for key {key!r}: {type(value)}")
+    return out
+
+
+def _cbor_decode_item(data: bytes, pos: int) -> tuple[CborScalar | dict, int]:
+    initial = data[pos]
+    major = initial >> 5
+    minor = initial & 0x1F
+    pos += 1
+
+    if minor < 24:
+        arg = minor
+    elif minor in (24, 25, 26, 27):
+        width = 1 << (minor - 24)
+        arg = int.from_bytes(data[pos : pos + width], "big")
+        pos += width
+    else:
+        raise SmpError(f"unsupported CBOR additional-information {minor} at offset {pos - 1}")
+
+    if major == 0:
+        return arg, pos
+    if major == 2:
+        return bytes(data[pos : pos + arg]), pos + arg
+    if major == 3:
+        return data[pos : pos + arg].decode("utf-8"), pos + arg
+    if major == 5:
+        result: dict[str, CborScalar] = {}
+        for _ in range(arg):
+            key, pos = _cbor_decode_item(data, pos)
+            if not isinstance(key, str):
+                raise SmpError(f"map key at offset {pos} is not a text string")
+            value, pos = _cbor_decode_item(data, pos)
+            result[key] = value
+        return result, pos
+
+    raise SmpError(f"unsupported CBOR major type {major} in an fs_mgmt response")
+
+
+def cbor_decode_map(data: bytes) -> dict[str, CborScalar]:
+    """Decode one definite-length top-level map, as every fs_mgmt response is."""
+    value, pos = _cbor_decode_item(data, 0)
+    if not isinstance(value, dict):
+        raise SmpError(f"expected a CBOR map at the top level, got {type(value).__name__}")
+    if pos != len(data):
+        raise SmpError(f"{len(data) - pos} trailing byte(s) after the top-level map")
+    return value
+
+
+def _check_rc(response: dict[str, CborScalar], context: str) -> None:
+    rc = response.get("rc")
+    if isinstance(rc, int) and rc != 0:
+        raise SmpError(f"{context}: device returned rc={rc}")
+
+
+class FsMgmt:
+    """fs_mgmt group commands: file download, status and checksum. Read-only by design --
+    there is no upload method here, matching survey_export.c's deny-by-default policy.
+    """
+
+    def __init__(self, smp: SmpSerial) -> None:
+        self.smp = smp
+
+    def stat(self, path: str) -> int:
+        """Return a file's length in bytes, via the fs_mgmt "stat" command."""
+        request = cbor_encode_map({"name": path})
+        response = self.smp.request(OP_READ, GROUP_FS, CMD_FS_STATUS, request)
+        result = cbor_decode_map(response.payload)
+        _check_rc(result, f"fs stat {path}")
+        length = result.get("len")
+        if not isinstance(length, int):
+            raise SmpError(f"fs stat {path}: response has no numeric 'len'")
+        return length
+
+    def checksum_crc32(self, path: str) -> int:
+        """Return the IEEE CRC32 (zlib.crc32 convention) of a whole file."""
+        request = cbor_encode_map({"name": path, "type": "crc32"})
+        response = self.smp.request(OP_READ, GROUP_FS, CMD_FS_CHECKSUM, request)
+        result = cbor_decode_map(response.payload)
+        _check_rc(result, f"fs checksum {path}")
+        output = result.get("output")
+        if not isinstance(output, int):
+            raise SmpError(f"fs checksum {path}: response has no numeric 'output'")
+        return output
+
+    def download(self, path: str) -> bytes:
+        """Download a whole file, one MCUMGR_GRP_FS_DL_CHUNK_SIZE chunk per request.
+
+        The total length is only carried in the response to the offset-0 request, so it is
+        read from there rather than from a separate "stat" round trip.
+        """
+        chunks: list[bytes] = []
+        offset = 0
+        total: int | None = None
+
+        while total is None or offset < total:
+            request = cbor_encode_map({"name": path, "off": offset})
+            response = self.smp.request(OP_READ, GROUP_FS, CMD_FS_FILE, request)
+            result = cbor_decode_map(response.payload)
+            _check_rc(result, f"fs download {path} at offset {offset}")
+
+            data = result.get("data")
+            if not isinstance(data, bytes):
+                raise SmpError(f"fs download {path}: response has no byte-string 'data'")
+
+            if offset == 0:
+                length = result.get("len")
+                if not isinstance(length, int):
+                    raise SmpError(f"fs download {path}: first response has no numeric 'len'")
+                total = length
+
+            if not data and offset < total:
+                raise SmpError(
+                    f"fs download {path}: empty chunk at offset {offset} of {total}"
+                )
+
+            chunks.append(data)
+            offset += len(data)
+
+        return b"".join(chunks)

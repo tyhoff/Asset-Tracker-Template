@@ -819,6 +819,15 @@ python3 -m unittest discover -s tests/host
 The decoder is stdlib-only by design so this stays true. See `tests/host/README.md` for how the CBOR
 fixtures are regenerated from the firmware encoder's actual output.
 
+`scripts/survey_smp.py` (the fs_mgmt client `scripts/survey_export.py` and the CP9 export path build
+on) needs pyserial, but only to open a real port. `import serial` lives inside `SmpSerial.__init__`,
+not at module scope, so the framing, the fs_mgmt CBOR encode/decode, and `FsMgmt` driven by a fake
+transport all stay importable — and unit-testable via `tests/host/test_survey_smp.py` and
+`tests/host/test_survey_export.py` — on a bare `python3` with no pyserial installed, same as the
+decoder above. Bare `python3 -m pip install pyserial` on this machine hits a PEP 668
+externally-managed-environment error; pulling `import serial` down into the one place that actually
+opens a port avoided needing to fight that just to run the host test suite.
+
 ## Hardware integration tests
 
 `tests/hardware/survey_hwtest.py` drives the console and asserts on the replies, so the on-target
