@@ -63,21 +63,34 @@ nrfutil toolchain-manager launch --ncs-version v3.4.0 -- bash -c '
     cd /Users/tyler/junk/ncs-3.4.0 &&
     west build -b thingy91x/nrf9151/ns --sysbuild -d build-att-survey \
         ../Asset-Tracker-Template/app -- \
-        -DEXTRA_CONF_FILE=overlay-survey.conf \
-        -DEXTRA_DTC_OVERLAY_FILE=overlay-survey.overlay
+        -DEXTRA_CONF_FILE="overlay-survey.conf;overlay-survey-export.conf" \
+        -DEXTRA_DTC_OVERLAY_FILE="overlay-survey.overlay;overlay-survey-export.overlay"
 '
 ```
 
-Both overlays are required. `overlay-survey.overlay` grows `littlefs_storage` from 1 MiB to 24 MiB,
-which is what `CONFIG_APP_STORAGE_MAX_RECORDS_PER_TYPE=25000` in the `.conf` is sized against.
-Building with the `.conf` alone links and flashes, then fails an `__ASSERT` inside the LittleFS
-backend at boot — the assert message names the block counts, so it is diagnosable, but the device is
-dead until it is reflashed. Confirm the partition took by checking the generated devicetree rather
-than trusting the command line:
+All four overlays are required. `overlay-survey.overlay` grows `littlefs_storage` from 1 MiB to
+24 MiB, which is what `CONFIG_APP_STORAGE_MAX_RECORDS_PER_TYPE=25000` in `overlay-survey.conf` is
+sized against. Building with `overlay-survey.conf` alone links and flashes, then fails an
+`__ASSERT` inside the LittleFS backend at boot — the assert message names the block counts, so it
+is diagnosable, but the device is dead until it is reflashed. Confirm the partition took by
+checking the generated devicetree rather than trusting the command line:
 
 ```sh
 grep -A3 'littlefs_storage:' build-att-survey/app/zephyr/zephyr.dts
 # reg = < 0x4d2000 0x1800000 >;
+```
+
+`overlay-survey-export.conf`/`.overlay` carry every MCUMGR/fs_mgmt Kconfig — leave them off and
+the build still links and flashes cleanly, but `CONFIG_MCUMGR` (and everything under it, including
+`CONFIG_UART_MCUMGR`) is silently absent, so `survey_smp.py`/`survey_export.py`/the web exporter
+all fail with `timed out waiting for a response to group 8 command 0` against a device that
+otherwise looks completely healthy (shell responds, capture cadence logs, `kernel reboot cold`
+shows a clean boot). This is the same "unmet `depends on` vanishes without a word" failure mode
+described below, so the fix is the same: grep the generated `.config` before trusting a build that
+merely succeeded:
+
+```sh
+grep -E '^CONFIG_MCUMGR=|^CONFIG_MCUMGR_GRP_FS=|^CONFIG_UART_MCUMGR=' build-att-survey/app/zephyr/.config
 ```
 
 **Fill build** — the survey build plus the bench load generator, which nothing else compiles:
@@ -461,6 +474,40 @@ comes up cannot be diagnosed with a prompt-synced driver at all: the driver hang
 prompt that never arrives. Kill it and read raw serial for ten seconds instead. That is how the
 `NET_BUF_POOL_ISOLATION` boot loop was identified.
 
+### A near-full partition makes the export transport hang, not just fail
+
+This is a second, distinct cost from the clear-is-slow trap above: at real trip fill levels (~5,000
+`SURVEY_*.bin` files at 60 s cadence and the FW-6 5-records-per-file layout — a matter of days, not
+an edge case) `fs_mgmt`/`survey_export.py`/the web exporter time out on every single-file `download`,
+not just on the bulk clear. Confirmed it is not transport-specific or code-specific: the console's
+own `fs ls /att_storage` took over 15 seconds and did not finish printing, and a clean `kernel reboot
+cold` reproduced it identically afterward. Root cause is that LittleFS resolves a path with a linear
+scan of its flat directory, so per-file open/lookup cost grows with file count — at the
+~2,700-file/~55%-full state this was still fast enough to stay under `mcumgr`'s command timeout, but
+at ~5,000 files it is not.
+
+Fixed by `CONFIG_APP_STORAGE_LITTLEFS_TARGET_FILE_SIZE` (`app/src/modules/storage/Kconfig.storage`,
+`littlefs_backend.c`'s `get_entries_per_file()`): each data file now holds a whole number of flash
+blocks instead of exactly one, so the same 25,000-record capacity is spread over far fewer files.
+The survey overlay sets it to 64 KiB (16 blocks), cutting the file count at full capacity from ~5,000
+to ~313 — comfortably under where the hang was observed. This only changes how records are grouped
+into files; `verify_partition_size()` counts blocks, not files, so total flash usage and capacity are
+unaffected. Three places duplicate the resulting entries-per-file arithmetic and must be kept in sync
+if either `CONFIG_APP_STORAGE_LITTLEFS_TARGET_FILE_SIZE` or the block size (4096 bytes) ever changes:
+`littlefs_backend.c` (the source of truth), `scripts/survey_export.py`'s `ENTRIES_PER_FILE`, and
+`web/export.html`'s `ENTRIES_PER_FILE` — fs_mgmt has no "describe your layout" command, so the two
+export clients have no way to ask the device instead of hardcoding it.
+
+The deeper issue this does *not* fix: records are stored in fixed-size slots sized for the worst case
+(one record with 5 cell towers and 10 APs), so a device that mostly sees one cell tower wastes most of
+each slot to padding. That is a separate, larger redesign (variable-length records) and is intentionally
+out of scope here — this fix only addresses file count.
+
+If diagnosing a timeout that looks like the FW-8/CP8 session-header work or the export transport
+itself, check file count and `fs ls` latency first: an A/B test that shows the timeout on both old and
+new firmware builds against a full partition, but not against a cleared one, is a fast way to rule the
+code out.
+
 ## Unit tests
 
 native_sim is Linux-only — Zephyr's POSIX arch refuses to configure on macOS with "The POSIX
@@ -820,9 +867,13 @@ it silently enabled, and give it an explicit off-switch if so.
 
 ### Capacity arithmetic on the LittleFS backend
 
-Record capacity is bounded by **blocks, not bytes**. The backend stores one file per block
-(`get_file_index()` is `index / entries_per_block`), so *N* records mean *N*/`entries_per_block`
-files, each consuming a whole erase block plus its directory metadata.
+Record capacity is bounded by **blocks, not bytes**. The backend groups
+`CONFIG_APP_STORAGE_LITTLEFS_TARGET_FILE_SIZE` worth of blocks into each file (default 0 = one block
+per file; the survey build sets 65536 = 16 blocks/file, see "A near-full partition..." above), so
+`get_file_index()` is `index / entries_per_file`, and *N* records mean *N*/`entries_per_file` files,
+each consuming a whole number of erase blocks plus its directory metadata. Total block count for a
+type is independent of this grouping — it is still `data_size * RECORDS_PER_TYPE / block_size` — only
+the file count (and therefore directory-metadata overhead) changes.
 
 `verify_partition_size()` does **not** check this — it models densely packed records plus a flat 3
 blocks, so it will pass a configuration that later runs the filesystem out of blocks mid-run. Size

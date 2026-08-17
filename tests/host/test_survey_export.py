@@ -24,7 +24,7 @@ import zlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent / "scripts"))
 
 from survey_export import (  # noqa: E402
-    ENTRIES_PER_BLOCK,
+    ENTRIES_PER_FILE,
     MOUNT_POINT,
     SLOT_SIZE,
     STORAGE_TYPE,
@@ -134,16 +134,18 @@ class TestIterLiveSlots(unittest.TestCase):
     def test_downloads_each_file_at_most_once(self) -> None:
         record = load_fixture("record")
         slot = pack_slot(record)
-        file0 = pack_file([slot] * ENTRIES_PER_BLOCK)
-        file1 = pack_file([slot] * ENTRIES_PER_BLOCK)
+        file0 = pack_file([slot] * ENTRIES_PER_FILE)
+        file1 = pack_file([slot] * ENTRIES_PER_FILE)
 
         fs = FakeFs()
         fs.put(f"{MOUNT_POINT}/{STORAGE_TYPE}_0.bin", file0)
         fs.put(f"{MOUNT_POINT}/{STORAGE_TYPE}_1.bin", file1)
 
-        # read_offset=3, write_offset=8 spans slots 3,4 of file 0 and slots 0,1,2 of file 1.
-        found = list(iter_live_slots(fs, 3, 8))
-        self.assertEqual([index for index, _ in found], [3, 4, 5, 6, 7])
+        # Spans the last two slots of file 0 and the first three slots of file 1.
+        start = ENTRIES_PER_FILE - 2
+        end = ENTRIES_PER_FILE + 3
+        found = list(iter_live_slots(fs, start, end))
+        self.assertEqual([index for index, _ in found], list(range(start, end)))
         for _, slot_bytes in found:
             self.assertEqual(slot_to_record(slot_bytes), record)
 
@@ -160,7 +162,7 @@ class TestExportRecords(unittest.TestCase):
         slot = pack_slot(record)
         fs = FakeFs()
         fs.put(f"{MOUNT_POINT}/{STORAGE_TYPE}.header", struct.pack("<II", 0, 3))
-        fs.put(f"{MOUNT_POINT}/{STORAGE_TYPE}_0.bin", pack_file([slot] * ENTRIES_PER_BLOCK))
+        fs.put(f"{MOUNT_POINT}/{STORAGE_TYPE}_0.bin", pack_file([slot] * ENTRIES_PER_FILE))
         return fs
 
     def test_writes_every_record_when_since_is_none(self) -> None:

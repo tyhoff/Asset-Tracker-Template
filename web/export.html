@@ -97,7 +97,17 @@ const STORAGE_TYPE = "SURVEY";
 // "describe your layout" command.
 const SLOT_SIZE = 816;
 const RECORDS_PER_TYPE = 25000;
-const ENTRIES_PER_BLOCK = Math.floor(4096 / SLOT_SIZE);
+// Mirrors littlefs_backend.c's get_entries_per_file() and scripts/survey_export.py's
+// BLOCK_SIZE/TARGET_FILE_SIZE/ENTRIES_PER_FILE. TARGET_FILE_SIZE mirrors
+// app/overlay-survey.conf's CONFIG_APP_STORAGE_LITTLEFS_TARGET_FILE_SIZE. If any of these
+// three parallel implementations change, all three need to change together.
+const BLOCK_SIZE = 4096;
+const TARGET_FILE_SIZE = 65536;
+const ENTRIES_PER_FILE = Math.floor((Math.max(1, Math.floor(TARGET_FILE_SIZE / BLOCK_SIZE)) * BLOCK_SIZE) / SLOT_SIZE);
+
+// Written once per boot by survey_session_ensure_written() (app/src/modules/survey/
+// survey_session.c). Mirrors scripts/survey_export.py's SESSION_PATH.
+const SESSION_PATH = `${MOUNT_POINT}/${STORAGE_TYPE}.session`;
 
 // --- byte helpers -----------------------------------------------------------------------
 
@@ -617,6 +627,21 @@ async function verifiedDownload(fs, path) {
   return data;
 }
 
+// Absent is normal (no boot has stored a record yet), not an error -- matches
+// scripts/survey_export.py's read_session(). Deliberately not CRC-verified via
+// verifiedDownload(): a single small chunk well under one fs_mgmt transfer has no
+// partial-write corruption risk, and this device's checksum/hash group returns rc=11 for
+// this file specifically even when the plain download is correct (verified on hardware
+// against the firmware's own boot-log line for the same session).
+async function readSession(fs) {
+  try {
+    return await fs.download(SESSION_PATH);
+  } catch (err) {
+    log(`no session header available: ${err.message}`);
+    return null;
+  }
+}
+
 function slotToRecord(slot) {
   if (slot.length < 4) throw new ExportError(`slot is ${slot.length} bytes, too short to carry a length prefix`);
   const length = new DataView(slot.buffer, slot.byteOffset, 4).getUint32(0, true);
@@ -630,6 +655,7 @@ function slotToRecord(slot) {
 // consecutive ring indices that land in it -- the same arithmetic survey_export.py's
 // iter_live_slots duplicates from the backend, because fs_mgmt has no indexed read.
 async function runExport(fs, onProgress) {
+  const session = await readSession(fs);
   const [readOffset, writeOffset] = await readHeader(fs);
   const total = writeOffset - readOffset;
   const chunks = [];
@@ -641,8 +667,8 @@ async function runExport(fs, onProgress) {
 
   for (let index = readOffset; index < writeOffset; index++) {
     const wrapped = index % RECORDS_PER_TYPE;
-    const fileIndex = Math.floor(wrapped / ENTRIES_PER_BLOCK);
-    const slotIndex = wrapped % ENTRIES_PER_BLOCK;
+    const fileIndex = Math.floor(wrapped / ENTRIES_PER_FILE);
+    const slotIndex = wrapped % ENTRIES_PER_FILE;
 
     if (fileIndex !== cachedIndex) {
       cachedBytes = await verifiedDownload(fs, pathForFileIndex(fileIndex));
@@ -664,7 +690,7 @@ async function runExport(fs, onProgress) {
     onProgress(seen, total, written);
   }
 
-  return { data: concatBytes(...chunks), seen, written, total, failures };
+  return { data: concatBytes(...chunks), seen, written, total, failures, session };
 }
 
 // --- UI wiring ---------------------------------------------------------------------------
@@ -783,6 +809,22 @@ exportBtn.addEventListener("click", async () => {
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
+
+    // Sidecar, not folded into the record stream -- matches
+    // scripts/survey_export.py's write_session_sidecar() naming and rationale.
+    if (result.session !== null) {
+      const sessionBlob = new Blob([result.session], { type: "application/octet-stream" });
+      const sessionUrl = URL.createObjectURL(sessionBlob);
+      const sessionFilename = `${filename}.session.cbor`;
+      const sessionLink = document.createElement("a");
+      sessionLink.href = sessionUrl;
+      sessionLink.download = sessionFilename;
+      document.body.appendChild(sessionLink);
+      sessionLink.click();
+      sessionLink.remove();
+      URL.revokeObjectURL(sessionUrl);
+      log(`session header written: ${sessionFilename}`, "ok");
+    }
 
     const failureNote = result.failures.length ? `, ${result.failures.length} record(s) failed (see log)` : "";
     exportStatus.textContent = `Done: ${result.written}/${result.seen} record(s) exported to ${filename}${failureNote}.`;

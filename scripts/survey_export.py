@@ -54,11 +54,18 @@ import sys
 import zlib
 from typing import BinaryIO, Final, Iterator, Optional, Sequence
 
-from survey_decode import CborError, decode_record
-from survey_smp import FsMgmt, SmpSerial
+from survey_decode import CborError, decode_record, decode_session
+from survey_smp import FsMgmt, SmpError, SmpSerial
 
 STORAGE_TYPE: Final[str] = "SURVEY"
 MOUNT_POINT: Final[str] = "/att_storage"
+
+# Written once per boot by survey_session_ensure_written() (app/src/modules/survey/
+# survey_session.c) -- device ID, app version, modem firmware version. Kept as a sidecar
+# file rather than folded into the record stream: the stream's length-prefixed framing has
+# no type tag, and record and session CBOR maps share a "version" key at index 1 with
+# different meanings, so interleaving them would make the stream ambiguous to decode.
+SESSION_PATH: Final[str] = f"{MOUNT_POINT}/{STORAGE_TYPE}.session"
 
 # Mirrors app/src/modules/survey/survey_store.h. Duplicated rather than queried, the same
 # way survey_store.c's own sequence recovery duplicates the backend's arithmetic instead of
@@ -71,12 +78,19 @@ SLOT_SIZE: Final[int] = 816
 # combine into a file index and an offset within it.
 RECORDS_PER_TYPE: Final[int] = 25000
 
-# The LittleFS backend computes this from fs_statvfs() at runtime; this export tool cannot
-# ask the device that over fs_mgmt, so it assumes the erase block size measured and recorded
-# for CP5/CP8 (app/src/modules/survey/survey_store.h): 4096 bytes, giving 5 slots of 816
-# bytes per data file. If a future board revision uses a different block size, this constant
-# -- and only this constant -- needs to change.
-ENTRIES_PER_BLOCK: Final[int] = 4096 // SLOT_SIZE
+# Mirrors littlefs_backend.c's get_entries_per_file(): each data file holds a whole number
+# of flash blocks (floor(TARGET_FILE_SIZE / BLOCK_SIZE), floored to 1) worth of slots. The
+# backend computes BLOCK_SIZE from fs_statvfs() at runtime; this export tool cannot ask the
+# device that over fs_mgmt, so it assumes the erase block size measured and recorded for
+# CP5/CP8 (app/src/modules/survey/survey_store.h): 4096 bytes. TARGET_FILE_SIZE mirrors
+# app/overlay-survey.conf's CONFIG_APP_STORAGE_LITTLEFS_TARGET_FILE_SIZE, which exists to
+# keep the file count low enough that fs_mgmt lookups do not time out on a near-full
+# partition (see "A near-full partition makes the export transport hang, not just fail" in
+# docs/common/dev_workflow.md). If either constant changes on the device side, both need to
+# change here too.
+BLOCK_SIZE: Final[int] = 4096
+TARGET_FILE_SIZE: Final[int] = 65536
+ENTRIES_PER_FILE: Final[int] = (max(1, TARGET_FILE_SIZE // BLOCK_SIZE) * BLOCK_SIZE) // SLOT_SIZE
 
 
 class ExportError(Exception):
@@ -114,13 +128,42 @@ def verified_download(fs: FsMgmt, path: str) -> bytes:
     return data
 
 
+def read_session(fs: FsMgmt) -> Optional[bytes]:
+    """Download the once-per-boot session header, or None if the device has none yet.
+
+    Absent is normal, not an error: a device that has not stored a record since its last
+    boot (freshly flashed, or storage cleared without a reboot -- survey_session_ensure_written()
+    only runs once per boot) has no SURVEY.session file.
+
+    Deliberately not CRC-verified like verified_download(): the session file is a single
+    small chunk (well under one fs_mgmt transfer), not a multi-chunk transfer with a real
+    partial-write corruption risk, and this device's fs_mgmt checksum/hash group returns
+    rc=11 for this file specifically even when the plain download is correct -- verified on
+    hardware by comparing a checksum-rejected download against the firmware's own boot-log
+    line for the same session.
+    """
+    try:
+        return fs.download(SESSION_PATH)
+    except SmpError as err:
+        print(f"no session header available: {err}", file=sys.stderr)
+        return None
+
+
+def write_session_sidecar(output_path: str, session: bytes) -> str:
+    """Write the session header next to a real output file. Returns the path written."""
+    sidecar = f"{output_path}.session.cbor"
+    with open(sidecar, "wb") as f:
+        f.write(session)
+    return sidecar
+
+
 def iter_live_slots(
     fs: FsMgmt, read_offset: int, write_offset: int
 ) -> Iterator[tuple[int, bytes]]:
     """Yield the raw SLOT_SIZE-byte slot for every record between the header's offsets.
 
     Downloads (and CRC-verifies) each data file once, even though a file holds
-    ENTRIES_PER_BLOCK records, by caching the current file's bytes across consecutive
+    ENTRIES_PER_FILE records, by caching the current file's bytes across consecutive
     indices -- the same file-index arithmetic survey_store.c's recover_last_sequence()
     duplicates from the backend for the same reason: there is no indexed read.
     """
@@ -129,8 +172,8 @@ def iter_live_slots(
 
     for index in range(read_offset, write_offset):
         wrapped = index % RECORDS_PER_TYPE
-        file_index = wrapped // ENTRIES_PER_BLOCK
-        slot_index = wrapped % ENTRIES_PER_BLOCK
+        file_index = wrapped // ENTRIES_PER_FILE
+        slot_index = wrapped % ENTRIES_PER_FILE
 
         if file_index != cached_index:
             cached_bytes = verified_download(fs, _path_for_file_index(file_index))
@@ -211,7 +254,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             read_offset, write_offset = read_header(fs)
             print(f"live records: {write_offset - read_offset} "
                   f"(read_offset={read_offset}, write_offset={write_offset})")
+            session = read_session(fs)
+            if session is not None:
+                try:
+                    info = decode_session(session)
+                    print(f"session: device={info['deviceId']} app={info['appVersion']} "
+                          f"modem={info['modemVersion']}")
+                except (CborError, ValueError) as err:
+                    print(f"session header present but could not be decoded: {err}",
+                          file=sys.stderr)
             return 0
+
+        session = read_session(fs)
 
         try:
             out = sys.stdout.buffer if args.output == "-" else open(args.output, "wb")
@@ -223,6 +277,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         finally:
             if out is not sys.stdout.buffer:
                 out.close()
+
+        if session is not None and args.output != "-":
+            sidecar = write_session_sidecar(args.output, session)
+            print(f"session header written: {sidecar}", file=sys.stderr)
     except ExportError as err:
         print(f"export failed: {err}", file=sys.stderr)
         return 1

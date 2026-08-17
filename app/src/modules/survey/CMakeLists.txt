@@ -16,6 +16,7 @@ target_sources_ifdef(CONFIG_APP_SURVEY_SHELL app PRIVATE
 
 target_sources_ifdef(CONFIG_APP_SURVEY_STORAGE app PRIVATE
 	${CMAKE_CURRENT_SOURCE_DIR}/survey_store.c
+	${CMAKE_CURRENT_SOURCE_DIR}/survey_session.c
 )
 
 target_sources_ifdef(CONFIG_APP_SURVEY_CAPTURE app PRIVATE

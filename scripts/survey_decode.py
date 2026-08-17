@@ -342,12 +342,19 @@ def decode_session(data: Union[bytes, bytearray, dict]) -> dict[str, Any]:
             f"this decoder understands version {SUPPORTED_VERSION}"
         )
 
-    session = {
-        "version": version,
-        "deviceId": raw[2],
-        "appVersion": raw[3],
-        "modemVersion": raw[4],
-    }
+    try:
+        session = {
+            "version": version,
+            "deviceId": raw[2],
+            "appVersion": raw[3],
+            "modemVersion": raw[4],
+        }
+    except KeyError as err:
+        # Reachable in practice: the session file is downloaded without a CRC check (see
+        # survey_export.py's read_session()), so a bit flip that still parses as CBOR but
+        # drops a required key must surface the same way a bad version does, not as a
+        # bare KeyError past every caller's (CborError, ValueError) handler.
+        raise CborError(f"session map is missing required key {err}") from err
     if 5 in raw:
         session["exportedAt"] = raw[5]
     return session
@@ -619,7 +626,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="keep records timestamped against uptime rather than Unix time")
     parser.add_argument("--allow-missing-bracket", action="store_true",
                         help="keep records without both bracketing GNSS fixes")
+    parser.add_argument("--session", metavar="PATH",
+                        help="decode the .session.cbor sidecar written alongside a "
+                             "survey_export.py output (see write_session_sidecar) and print "
+                             "its device/app/modem info to stderr before the records")
     args = parser.parse_args(argv)
+
+    if args.session:
+        session_raw = open(args.session, "rb").read()
+        try:
+            info = decode_session(session_raw)
+            print(f"session: device={info['deviceId']} app={info['appVersion']} "
+                  f"modem={info['modemVersion']}", file=sys.stderr)
+        except (CborError, ValueError) as err:
+            print(f"session header at {args.session} could not be decoded: {err}",
+                  file=sys.stderr)
 
     if args.hex:
         text = sys.stdin.read() if args.input == "-" else open(args.input).read()

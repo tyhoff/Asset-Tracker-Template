@@ -315,24 +315,36 @@ static int write_storage_file_header(const struct storage_data *type,
 }
 
 /*
- * @brief Get the entries per block object
+ * @brief Get the entries per file object
  *
- * Determines how many entries of the given storage data type can fit in a single
- * filesystem block.
+ * Determines how many entries of the given storage data type can fit in a single data
+ * file, which spans one or more filesystem blocks -- see
+ * CONFIG_APP_STORAGE_LITTLEFS_TARGET_FILE_SIZE.
  *
  * @param type Storage data type
- * @param entries_per_block Pointer to store the number of entries per block
+ * @param entries_per_file Pointer to store the number of entries per file
  * @return int 0 on success, negative errno on failure
  */
-static int get_entries_per_block(const struct storage_data *type, size_t *entries_per_block)
+static int get_entries_per_file(const struct storage_data *type, size_t *entries_per_file)
 {
+	size_t blocks_per_file;
+
 	__ASSERT(cached_block_size > 0,
 		 "Block size not yet cached; verify_partition_size() must run first");
 
-	*entries_per_block = cached_block_size / type->data_size;
-	if (*entries_per_block == 0) {
-		LOG_ERR("Data size %zu exceeds block size %zu",
-			type->data_size, cached_block_size);
+	/* Integer division floors, so a target below one block (including the default of 0)
+	 * yields 0 here -- corrected to a floor of one block, which reproduces the
+	 * one-file-per-block behaviour every build had before this option existed.
+	 */
+	blocks_per_file = CONFIG_APP_STORAGE_LITTLEFS_TARGET_FILE_SIZE / cached_block_size;
+	if (blocks_per_file < 1) {
+		blocks_per_file = 1;
+	}
+
+	*entries_per_file = (blocks_per_file * cached_block_size) / type->data_size;
+	if (*entries_per_file == 0) {
+		LOG_ERR("Data size %zu exceeds file size %zu",
+			type->data_size, blocks_per_file * cached_block_size);
 
 		return -EFBIG;
 	}
@@ -343,25 +355,25 @@ static int get_entries_per_block(const struct storage_data *type, size_t *entrie
 /*
  * @brief Get the file index for a given entry index
  *
- * @param entries_per_block Number of entries per block
+ * @param entries_per_file Number of entries per file
  * @param index Entry index
  * @return int File index
  */
-static int get_file_index(size_t entries_per_block, uint32_t index)
+static int get_file_index(size_t entries_per_file, uint32_t index)
 {
-	return index / entries_per_block;
+	return index / entries_per_file;
 }
 
 /*
- * @brief Get the offset index within a block for a given entry index
+ * @brief Get the offset index within a file for a given entry index
  *
- * @param entries_per_block Number of entries per block
+ * @param entries_per_file Number of entries per file
  * @param index Entry index
- * @return int Offset index within the block
+ * @return int Offset index within the file
  */
-static int get_entry_offset_index(size_t entries_per_block, uint32_t index)
+static int get_entry_offset_index(size_t entries_per_file, uint32_t index)
 {
-	return index % entries_per_block;
+	return index % entries_per_file;
 }
 
 /*
@@ -521,7 +533,7 @@ static int lfs_storage_store(const struct storage_data *type, const void *data, 
 	struct fs_file_t file;
 	struct storage_file_header header;
 	size_t write_pos;
-	size_t entries_per_block;
+	size_t entries_per_file;
 	int was_full;
 	int wrapped_index;
 	int file_index;
@@ -542,14 +554,14 @@ static int lfs_storage_store(const struct storage_data *type, const void *data, 
 		return ret;
 	}
 
-	ret = get_entries_per_block(type, &entries_per_block);
+	ret = get_entries_per_file(type, &entries_per_file);
 	if (ret < 0) {
 		return ret;
 	}
 
 	wrapped_index = header.write_offset % RECORDS_PER_TYPE;
-	file_index = get_file_index(entries_per_block, wrapped_index);
-	entry_offset_index = get_entry_offset_index(entries_per_block, wrapped_index);
+	file_index = get_file_index(entries_per_file, wrapped_index);
+	entry_offset_index = get_entry_offset_index(entries_per_file, wrapped_index);
 	was_full = ((header.write_offset - header.read_offset) >= RECORDS_PER_TYPE);
 	write_pos = (entry_offset_index % RECORDS_PER_TYPE) * type->data_size;
 
@@ -643,7 +655,7 @@ static int read_data_entry(const struct storage_data *type, void *data, size_t s
 	struct storage_file_header header;
 	uint8_t temp_buffer[STORAGE_MAX_DATA_SIZE];
 	size_t read_pos;
-	size_t entries_per_block;
+	size_t entries_per_file;
 	int read_bytes;
 	int wrapped_index;
 	int file_index;
@@ -674,14 +686,14 @@ static int read_data_entry(const struct storage_data *type, void *data, size_t s
 		return -EAGAIN;
 	}
 
-	ret = get_entries_per_block(type, &entries_per_block);
+	ret = get_entries_per_file(type, &entries_per_file);
 	if (ret < 0) {
 		return ret;
 	}
 
 	wrapped_index = header.read_offset % RECORDS_PER_TYPE;
-	file_index = get_file_index(entries_per_block, wrapped_index);
-	entry_offset_index = get_entry_offset_index(entries_per_block, wrapped_index);
+	file_index = get_file_index(entries_per_file, wrapped_index);
+	entry_offset_index = get_entry_offset_index(entries_per_file, wrapped_index);
 	read_pos = (entry_offset_index % RECORDS_PER_TYPE) * type->data_size;
 
 	/* Open storage file */

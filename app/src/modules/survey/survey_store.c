@@ -15,6 +15,7 @@
 #include "survey_record.h"
 #include "survey_record_decode.h"
 #include "survey_record_types.h"
+#include "survey_session.h"
 #include "survey_store.h"
 
 #if defined(CONFIG_APP_SURVEY_LOG_LEVEL)
@@ -181,7 +182,7 @@ static K_MUTEX_DEFINE(sequence_recovery_lock);
 static bool sequence_recovered;
 
 /* Duplicates the LittleFS backend's record-locating arithmetic (littlefs_backend.c:
- * get_entries_per_block(), get_file_index(), get_entry_offset_index(), and the header
+ * get_entries_per_file(), get_file_index(), get_entry_offset_index(), and the header
  * layout) rather than extending that backend with an indexed-read primitive it does not
  * have. That backend is upstream-owned; this file is not.
  *
@@ -190,7 +191,12 @@ static bool sequence_recovered;
  * that does not exist, a seek past what was written, a slot that does not decode -- just
  * falls through to "start at 0", which is the behaviour a corrupted or unreadable last
  * record is supposed to get anyway. A mismatch here is never a silently wrong sequence
- * number, only an unnecessarily conservative one.
+ * number, only an unnecessarily conservative one -- but that guarantee only holds if this
+ * arithmetic actually mirrors get_entries_per_file(), including the TARGET_FILE_SIZE
+ * block-grouping it applies; a mismatch that still lands on a real, in-bounds file would
+ * read a real (wrong) record instead of failing to open it. Keep this in sync with
+ * CONFIG_APP_STORAGE_LITTLEFS_TARGET_FILE_SIZE the same way scripts/survey_export.py and
+ * web/export.html do.
  */
 static uint32_t recover_last_sequence(void)
 {
@@ -201,7 +207,8 @@ static uint32_t recover_last_sequence(void)
 	} header;
 	struct fs_statvfs stat;
 	char path[sizeof("/att_storage/SURVEY_4294967295.bin")];
-	size_t entries_per_block;
+	size_t blocks_per_file;
+	size_t entries_per_file;
 	uint32_t wrapped_index;
 	uint32_t file_index;
 	uint32_t entry_offset_index;
@@ -245,17 +252,25 @@ static uint32_t recover_last_sequence(void)
 		return 0;
 	}
 
-	entries_per_block = stat.f_frsize / SURVEY_STORE_SLOT_SIZE;
-	if (entries_per_block == 0) {
-		STORE_WRN("Sequence recovery: slot size exceeds block size; starting a new "
+	/* Mirrors get_entries_per_file()'s blocks_per_file floor of 1: a TARGET_FILE_SIZE of 0
+	 * (the default) or below one block reproduces the original one-block-per-file layout.
+	 */
+	blocks_per_file = CONFIG_APP_STORAGE_LITTLEFS_TARGET_FILE_SIZE / stat.f_frsize;
+	if (blocks_per_file < 1) {
+		blocks_per_file = 1;
+	}
+
+	entries_per_file = (blocks_per_file * stat.f_frsize) / SURVEY_STORE_SLOT_SIZE;
+	if (entries_per_file == 0) {
+		STORE_WRN("Sequence recovery: slot size exceeds file size; starting a new "
 			  "sequence at 0");
 
 		return 0;
 	}
 
 	wrapped_index = (header.write_offset - 1) % CONFIG_APP_STORAGE_MAX_RECORDS_PER_TYPE;
-	file_index = wrapped_index / entries_per_block;
-	entry_offset_index = wrapped_index % entries_per_block;
+	file_index = wrapped_index / entries_per_file;
+	entry_offset_index = wrapped_index % entries_per_file;
 
 	ret = snprintk(path, sizeof(path), "/att_storage/SURVEY_%u.bin", file_index);
 	if (ret < 0 || ret >= (int)sizeof(path)) {
@@ -306,6 +321,15 @@ static uint32_t recover_last_sequence(void)
 
 uint32_t survey_store_next_sequence(void)
 {
+	/* Not folded into the sequence_recovered guard below: survey_session_ensure_written()
+	 * no-ops once it has actually succeeded, but retries on every call until then, so a
+	 * transient failure (e.g. the modem not yet attached, or nRF Cloud client ID not yet
+	 * provisioned, at cold boot) does not permanently lose the session header for the
+	 * boot the way gating it behind a "ran once" flag would. See FW-8 in REQUIREMENTS.md
+	 * for why a session header needs a once-per-boot write and did not have one until now.
+	 */
+	survey_session_ensure_written();
+
 	k_mutex_lock(&sequence_recovery_lock, K_FOREVER);
 	if (!sequence_recovered) {
 		atomic_set(&sequence_next, (atomic_val_t)recover_last_sequence());

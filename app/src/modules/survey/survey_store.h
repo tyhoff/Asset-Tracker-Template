@@ -59,19 +59,21 @@ extern "C" {
  * per block is `block_size % slot_size` -- and at the 4096-byte erase block of the
  * Thingy:91 X external flash, 816 gives 5 slots using 4080 of 4096 bytes. Rounding up to
  * 1024 instead would fit 4 slots and throw away a fifth of a 24 MiB partition, which is
- * most of a day of driving.
+ * most of a day of driving. See FW-6 in REQUIREMENTS.md.
  *
- * The 16 bytes left over are not slack, they are the reason this works. The backend keeps
- * one *file* per block, so each file is entries_per_block * slot_size = 4080 bytes, and
- * LittleFS stores a file in a single block only while it is at most block_size - 8 bytes
- * (the CTZ skip-list reserves two 4-byte pointers). 4080 clears 4088 by eight bytes. A
- * slot size that packed the block more tightly -- 819, say, for 4095 of 4096 -- would push
- * every file onto a second block and double the partition's block cost overnight, which
- * the byte-based verify_partition_size() check would not notice. See FW-6 in
- * REQUIREMENTS.md.
+ * The CTZ-skip-list argument that originally justified 816 over a tighter-packed value
+ * like 819 (single-block-file storage needs at most block_size - 8 bytes, the skip-list's
+ * two 4-byte pointers) only applies when each file is exactly one block --
+ * CONFIG_APP_STORAGE_LITTLEFS_TARGET_FILE_SIZE at its default of 0. The survey overlay
+ * sets that to 65536 (16 blocks/file, see app/overlay-survey.conf and "A near-full
+ * partition..." in docs/common/dev_workflow.md), specifically to cut the file count at
+ * full capacity and avoid an fs_mgmt/LittleFS directory-scan timeout; at that file size the
+ * single-block CTZ ceiling no longer constrains slot packing, though 816 is still a fine
+ * choice on its own byte-waste terms.
  *
  * If the block size turns out not to be 4096, nothing breaks: the backend computes
- * entries-per-block at runtime from fs_statvfs(). Only the packing efficiency changes.
+ * entries-per-file at runtime from fs_statvfs() and CONFIG_APP_STORAGE_LITTLEFS_TARGET_FILE_SIZE.
+ * Only the packing efficiency changes.
  */
 #define SURVEY_STORE_SLOT_SIZE 816
 

@@ -50,6 +50,27 @@ config APP_STORAGE_LITTLEFS_MAX_PATH_LEN
 	  Maximum length of file names used by the storage module
 	  in the LittleFS backend.
 
+config APP_STORAGE_LITTLEFS_TARGET_FILE_SIZE
+	int "Target size in bytes for each LittleFS data file"
+	default 0
+	range 0 16777216
+	help
+	  Each data file holds a whole number of flash blocks, so this is rounded down to
+	  the nearest block-sized multiple, with a floor of one block. 0 (the default)
+	  means one block per file, which is every build's behaviour before this option
+	  existed.
+
+	  LittleFS resolves a path with a linear scan of the directory it lives in, so
+	  open/lookup time on a data file grows with how many files share its directory.
+	  A type with a large APP_STORAGE_MAX_RECORDS_PER_TYPE and a small per-record size
+	  (many records per block) accumulates one file per block's worth of records --
+	  thousands of files in the same flat directory at full capacity -- and at that
+	  point per-file open time can exceed an mcumgr/fs_mgmt command timeout, hanging
+	  the export transport (and even the console's own "fs ls"). Raising this to a few
+	  tens of kilobytes divides the file count by roughly (target size / block size)
+	  without changing how many bytes the type needs overall: verify_partition_size()
+	  counts blocks, not files, so total flash usage is unaffected.
+
 choice APP_STORAGE_FULL
 	prompt "Behaviour when storage is full"
 	default APP_STORAGE_FULL_OVERWRITE

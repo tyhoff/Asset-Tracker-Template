@@ -328,24 +328,37 @@ design choice rather than a rounding of the record size:
 - Payload 812 B ≥ the 700 B record budget (`survey_store.c` BUILD_ASSERTs this; the measured DEEP
   record is 585 B).
 
-**The binding resource is blocks, not bytes.** The backend keeps **one file per block** —
-`get_file_index()` is `index / entries_per_block`, and `create_storage_file_path()` turns that into
-`SURVEY_<n>.bin`. So *N* records cost *N*/5 **files**, each holding 4080 of a block's 4096 bytes and
-each consuming a whole block, plus the LittleFS directory metadata for every one of those entries.
+**The binding resource is blocks, not bytes.** The math below (`get_file_index()` is
+`index / entries_per_block`, one file per block) was the original design and is still what
+`CONFIG_APP_STORAGE_LITTLEFS_TARGET_FILE_SIZE` defaults to (0) for any type that does not override
+it. **The survey build no longer uses it**: `app/overlay-survey.conf` sets that Kconfig to 65536 (16
+blocks/file), so `get_file_index()` is now `index / entries_per_file` with `entries_per_file = 80`,
+not 5, and 25,000 records live in **~313 files**, not 5,000. This exists specifically because 5,000
+files in one flat LittleFS directory made `fs_mgmt` downloads (and the console's own `fs ls`) time
+out at near-full capacity — see "A near-full partition makes the export transport hang, not just
+fail" in `docs/common/dev_workflow.md`. The per-block waste analysis below (why 816 B, not 819 or
+1024) is unaffected by this — it is about slot size within a block, not files per block — but the
+file-count and metadata-overhead numbers that follow describe the pre-fix, one-block-per-file
+layout and are stale for the survey build specifically.
 
 - Partition **24 MiB** = 6144 blocks.
-- 25,000 records → **5,000 files → 5,000 data blocks**, plus directory metadata pairs for 5,000
-  entries in one directory (order 200–250 blocks), the superblock pair, and free blocks for
-  copy-on-write and `block-cycles` relocation. Roughly **15 % spare**.
+- 25,000 records → **5,000 files → 5,000 data blocks** *(pre-fix; survey build is now ~313 files,
+  same 5,000 data blocks)*, plus directory metadata pairs for 5,000 entries in one directory (order
+  200–250 blocks) *(now ~313 entries, well under that)*, the superblock pair, and free blocks for
+  copy-on-write and `block-cycles` relocation. Roughly **15 % spare**, now more given the reduced
+  directory-metadata cost.
 - `CONFIG_APP_STORAGE_MAX_RECORDS_PER_TYPE=25000`.
 
-**One data block per file only holds while the file stays under 4088 bytes.** LittleFS keeps a file
-in a single block only up to `block_size - 8` — the CTZ skip-list reserves two 4-byte pointers — so
-the 16 bytes that 816 B slots leave at the end of each block are not slack, they are what keeps each
-file single-block. 4080 clears 4088 by **eight bytes**. A slot size chosen to pack the block harder
-(819 B → 4095 of 4096, which looks strictly better on a waste-percentage basis) would put every file
-on two blocks and double the partition's block cost. The margin is documented at
-`SURVEY_STORE_SLOT_SIZE` in `survey_store.h`; anyone retuning the slot size has to re-check it.
+**One data block per file only holds while the file stays under 4088 bytes** — this constraint
+applied to the original one-block-per-file layout above; it no longer constrains the survey build,
+which groups 16 blocks per file. LittleFS keeps a file in a single block only up to `block_size - 8`
+— the CTZ skip-list reserves two 4-byte pointers — so the 16 bytes that 816 B slots leave at the end
+of each block were not slack, they were what kept each file single-block *when each file was exactly
+one block*. 4080 clears 4088 by **eight bytes**. A slot size chosen to pack the block harder (819 B →
+4095 of 4096, which looks strictly better on a waste-percentage basis) would have put every file on
+two blocks and doubled the partition's block cost under the old layout. The margin is documented at
+`SURVEY_STORE_SLOT_SIZE` in `survey_store.h`; anyone retuning the slot size for a build that still
+uses the one-block-per-file default has to re-check it.
 
 The backend's own `verify_partition_size()` **cannot** check this. It computes
 `ceil(data_size × RECORDS_PER_TYPE / block_size)` — densely packed records — plus a flat 3 blocks,
