@@ -10,6 +10,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/zbus/zbus.h>
 #include <zephyr/fs/fs.h>
+#include <zephyr/sys/iterable_sections.h>
 
 #include "survey_obs.h"
 #include "survey_record.h"
@@ -17,6 +18,8 @@
 #include "survey_record_types.h"
 #include "survey_session.h"
 #include "survey_store.h"
+#include "storage_data_types.h"
+#include "storage_backend.h"
 
 #if defined(CONFIG_APP_SURVEY_LOG_LEVEL)
 #include <zephyr/logging/log.h>
@@ -387,4 +390,32 @@ int survey_store_publish_record(const struct survey_record_data *record)
 	k_mutex_unlock(&staging_lock);
 
 	return err;
+}
+
+bool survey_store_is_full(void)
+{
+#if defined(CONFIG_APP_STORAGE_FULL_STOP)
+	const struct storage_backend *backend = storage_backend_get();
+
+	/* SURVEY is only registered when CONFIG_APP_SURVEY_STORAGE is on -- see
+	 * DATA_SOURCE_LIST in storage_data_types.h -- which is always true wherever this
+	 * function is reachable, so the loop always finds it.
+	 */
+	STRUCT_SECTION_FOREACH(storage_data, type) {
+		if (type->data_type == STORAGE_TYPE_SURVEY) {
+			int count = backend->count(type);
+
+			/* A backend error (count < 0) is treated as full, not as "not full": this
+			 * function exists specifically so the LED never claims success when it
+			 * can't confirm capacity, and failing open here would defeat that.
+			 */
+			return count < 0 || count >= CONFIG_APP_STORAGE_MAX_RECORDS_PER_TYPE;
+		}
+	}
+#endif /* CONFIG_APP_STORAGE_FULL_STOP */
+
+	/* APP_STORAGE_FULL_OVERWRITE never stops accepting records -- the oldest one is
+	 * dropped instead -- so there is no "full" condition for this function to report.
+	 */
+	return false;
 }

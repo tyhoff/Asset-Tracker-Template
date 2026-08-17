@@ -880,6 +880,47 @@ blocks, so it will pass a configuration that later runs the filesystem out of bl
 `CONFIG_APP_STORAGE_MAX_RECORDS_PER_TYPE` from the file count and leave real margin. See the FW-6
 section of `REQUIREMENTS.md` for the worked example.
 
+### `storage_backend.h` must be included after `storage_data_types.h`
+
+`storage_backend.h`'s vtable takes `const struct storage_data *` parameters but never forward-declares
+or includes the struct itself — it relies on whatever included it first having already pulled in
+`storage_data_types.h`. `storage.h` does that internally, so any file that only ever includes
+`storage.h` before `storage_backend.h` never notices. A file that includes `storage_backend.h`
+directly (as `survey_store.c` now does, for FW-9's `survey_store_is_full()`) without `storage.h` in
+between has to include `storage_data_types.h` first itself, or GCC treats `struct storage_data` in
+the vtable's parameter lists as a *new*, parameter-scope-local, incompatible type — `-Werror`
+rejects it outright on target (`'struct storage_data' declared inside parameter list will not be
+visible outside of this definition or declaration`), and even without `-Werror` a caller passing a
+real `struct storage_data *` gets `passing argument ... from incompatible pointer type`, because the
+two "struct storage_data"s are unrelated as far as the compiler is concerned.
+
+### A test's own `CMakeLists.txt` needs updating for every new Kconfig symbol it compiles against
+
+`tests/module/survey_store` builds real `storage.c`/`storage_data_types.c`/`littlefs_backend.c`
+against symbols defined via `target_compile_definitions`, the same pattern as
+`tests/module/storage/littlefs_backend` (see "Capacity arithmetic on the LittleFS backend" above).
+Adding `CONFIG_APP_STORAGE_LITTLEFS_TARGET_FILE_SIZE` earlier only updated the `littlefs_backend`
+test's `CMakeLists.txt` — `survey_store` compiles the same backend file and was left with the symbol
+undefined, a build break that sat unnoticed because nothing re-ran that suite until FW-9 touched
+`survey_store.c` and forced a rebuild. Any test that hardcodes a module's Kconfig via `-D` flags
+needs every one of that module's symbols kept in sync by hand; there is no `depends on` here to catch
+the gap, and a passing suite from before the symbol existed proves nothing about after.
+
+### A storage backend call from a non-storage thread needs its own locking
+
+`storage.c` has no mutexes anywhere — its safety has always come entirely from every
+`backend->count()`/`store()`/`retrieve()` call happening serially on `storage_thread`, one zbus
+message at a time. FW-9's `survey_store_is_full()` (`survey_store.c`) is the first caller of a
+backend function from a different thread (the survey capture thread), so it can run concurrently
+with `storage_thread`. For the LittleFS backend this matters concretely: `count()` and `store()`
+both go through `read_storage_file_header()`/`write_storage_file_header()`
+(`littlefs_backend.c`), which do an unsynchronized `fs_seek` then `fs_read`/`fs_write` on a
+per-type, permanently-open `fs_file_t` handle — two threads' seek+read/write pairs can interleave
+mid-operation with no lock to stop them. Pre-commit review caught this; fixed with a `k_mutex`
+added in `littlefs_backend.c` around those two functions' body. If a future change adds another
+cross-thread caller of `storage_backend_get()`, check it against this — the header file locking
+covers it, but any *new* shared state introduced in the backend won't be protected automatically.
+
 ## Host tests
 
 The Python under `scripts/` has its own suite, which does not involve Docker, Zephyr, or a toolchain:

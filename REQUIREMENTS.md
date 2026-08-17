@@ -562,7 +562,7 @@ the shell and a dedicated uart1 CDC port answer SMP correctly (see
 `app/overlay-survey-export.overlay`'s header comment for how uart1 was routed there without
 colliding with modem tracing, which also wants it).
 
-### FW-9 — Field usability ⚠️ partial
+### FW-9 — Field usability
 
 Operators are employees driving vehicles, with no console attached.
 
@@ -571,14 +571,65 @@ Operators are employees driving vehicles, with no console attached.
 - Must run headless from cold boot with no host interaction.
 - Keep the task-watchdog coverage the template already provides on every module thread.
 
-**What CP10 actually shipped is 2 states, not 5:** `survey_capture.c`'s `survey_led_signal()`
-latches green on any cycle that stored a record, red on any cycle that didn't (empty result or a
-store failure), via the existing `led_chan` zbus channel — no separate "searching" state, no
-distinct GNSS-poor-fix signal, no storage-full signal. Repetitions is `-1` so the pattern holds
-until the next cycle overwrites it, rather than going dark a couple of seconds after a capture and
-reading as "device is off." The 3 remaining unimplemented states (searching, GNSS-poor-vs-absent,
-storage-full) are a real gap against the FW-9 text above, not an oversight — closing them cleanly
-needs the LED module to expose more than "set this pattern," which is out of scope for this pass.
+**All 5 states are now implemented, without changing the `led` module.** The earlier CP10 note
+below assumed closing the gap needed the module to expose more than "set this pattern" — it
+didn't: the 5 states are temporally exclusive (a cycle is either searching or finished, and a
+finished cycle is in exactly one of the other 4), so `led`'s existing last-write-wins semantics
+are already sufficient. `survey_capture.c`'s `survey_led_signal()` takes an `enum
+survey_led_state` and publishes one of 5 dim (~55/255) colors via `led_chan`, still with
+`repetitions = -1` so the pattern holds until the next cycle overwrites it:
+
+- **SEARCHING** (blue, fast blink) publishes at the start of every cycle, so a cycle that hangs
+  reads as "still searching" rather than showing the previous cycle's stale result.
+- **CAPTURE_OK** (green, slow blink) — a record was stored and at least one GNSS bracket had a fix.
+- **GNSS_POOR** (amber, slow blink) — a record was stored, but neither bracket got a fix. The radio
+  observation is saved regardless (see `survey_store_publish_record`'s `-EINVAL` rationale), but
+  the operator should know positioning is degraded. Amber is `{red: 55, green: 45}` rather than a
+  duller green — pre-commit review flagged the original `{red: 55, green: 25}` as reading like "dim
+  red" next to ERROR at a glance, which matters since the two states call for different operator
+  actions (move to open sky vs. something is actually broken).
+- **STORAGE_FULL** (magenta, slow blink) — the survey storage type is at capacity under
+  `APP_STORAGE_FULL_STOP`, so further records are being silently dropped. Checked ahead of
+  GNSS_POOR/CAPTURE_OK, since an operator who can only see one color needs to know recording has
+  stopped before they need to know fix quality.
+- **ERROR** (red, fast blink) — a cycle produced nothing to store, or the store failed for a reason
+  other than being full.
+
+The gap this closes was more than cosmetic: before this pass, `survey_store_publish_record()`'s
+return value reflected only whether the record reached the storage module's queue, not whether the
+asynchronous flash write that follows actually succeeded — `storage.c`'s `handle_data_message()`
+logs a failed `backend->store()` but never propagates it. A full partition under
+`APP_STORAGE_FULL_STOP` therefore showed **green** (success) on the exact cycle whose record was
+silently dropped. Rather than editing upstream-owned `storage.c` to propagate that failure, the fix
+is proactive and additive: `survey_store_is_full()` (new, in `survey_store.c`) asks the backend's
+current record count synchronously via the existing `storage_backend_get()->count()` API and
+compares it against `CONFIG_APP_STORAGE_MAX_RECORDS_PER_TYPE`, so the LED can be right before a
+store is even attempted. It is a no-op under `APP_STORAGE_FULL_OVERWRITE`, which never actually
+stops accepting records. Covered by two new cases in `tests/module/survey_store` (one per
+full-behaviour build) and a stub in `tests/module/survey_capture`, which fixes it to `false` since
+that suite's own concern is step sequencing, not the storage-full path. A backend read error
+(negative count) is treated as full rather than as "not full" — this function exists so the LED
+never claims success when it can't confirm capacity, and failing open would defeat that.
+
+`survey_store_is_full()` is the first caller of a storage backend function from a thread other than
+storage's own (it runs on the survey capture thread). Pre-commit review caught that this raced with
+`storage.c`'s own thread over the LittleFS backend's permanently-open header file handle
+(`type_state[idx].header_file` in `littlefs_backend.c`) — both `read_storage_file_header()` and
+`write_storage_file_header()` do an unsynchronized `fs_seek` then `fs_read`/`fs_write`, and nothing
+prevented the two threads' seek+read/write pairs from interleaving. A torn read is not just
+cosmetic here: the header's `write_offset - read_offset` is an unsigned subtraction, so a torn read
+could underflow to a huge value and make `survey_store_is_full()` report "definitely full" when it
+isn't, or worse, a stomped seek position between the two threads could corrupt the on-flash header.
+Fixed with a `k_mutex` added directly in `littlefs_backend.c` (upstream-owned; this is a deliberate,
+minimal exception to preferring additive-only changes, made because the race is a genuine
+correctness bug rather than a place upstream divergence was worth avoiding), guarding the
+seek+read/seek+write+sync pairs in both functions. Re-verified: `tests/module/survey_store`,
+`tests/module/survey_capture`, and `tests/module/storage/littlefs_backend` all still pass, and the
+survey-overlay firmware build still succeeds (see updated numbers below).
+
+Not hardware-verified: this pass had no Thingy:91 X available, so verification is build +
+`tests/module/survey_capture` + `tests/module/survey_store` (native_sim/Twister) only. The color
+and blink-rate choices have not been visually confirmed on a real LED.
 
 `main.c` publishes to `led_chan` on its own schedule for the asset-tracker's own states (blue
 "sampling", green "sending", red "disconnected", purple "FOTA download") — all four ungated
@@ -781,7 +832,7 @@ hardware**. `native_sim` proofs are the gate for merging; on-target proofs are r
 | **CP7** | FW-2 profiles FAST/DEEP + gating | Unit test: gating decisions across a speed/power truth table; assert DEEP requests GCI | `survey profile deep` yields multiple full-identity GCI cells; FAST does not |
 | **CP8** ✅ | FW-8 export over `fs_mgmt` (MCUmgr): `scripts/survey_smp.py` (SMP serial framing + fs_mgmt CBOR + `FsMgmt.stat/checksum_crc32/download`) and `scripts/survey_export.py` (CLI, walks the ring buffer, CRC32-verifies each file, writes a length-prefixed CBOR stream); `scripts/survey_decode.py` extended to parse that stream | **Done.** `tests/host` = **103/103** (up from 58 at CP4), stdlib only — `import serial` is deferred into `SmpSerial.__init__` so the framing, CBOR and `FsMgmt` stay testable via a fake transport without pyserial installed. `survey_export.py` itself carries PEP 723 metadata (`# /// script` dependency block) so `uv run scripts/survey_export.py ...` provisions pyserial into an isolated environment on first run — no system-Python `pip install` fight. Framing verified against Zephyr 4.4's own `fs_mgmt.c`/`crc32_sw.c` source rather than assumed field names; the CRC32 used is confirmed bit-identical to `zlib.crc32`. No firmware changes this checkpoint — CP6's on-flash layout is read as-is. Known limitation: no session header (see FW-8). | **Run on target.** `uv run scripts/survey_export.py --port /dev/cu.usbmodem105 --baud 1000000 ...` against a real Thingy:91 X: `--stats-only` reported 5,083 live records; a full export downloaded and CRC32-verified all of them, and every one decoded cleanly (5,083/5,083, all bytes consumed, no trailing garbage). This run also caught a real client bug the host tests never could — mcumgr's zcbor encoder returns **indefinite-length** CBOR maps (additional-info 31, terminated by a `0xFF` break byte) on real fs_mgmt responses, which the hand-rolled decoder in `survey_smp.py` didn't handle; fixed, host suite still 103/103 green. (Also observed: the record `sequence` field resets on device reboot rather than staying globally monotonic — real device behaviour, not a decoder defect; `--since` filtering does not assume global monotonicity, so this is not a problem for it.) |
 | **CP9** ✅ | HOST-2: `web/export.html`, a self-contained Chrome/Edge Web Serial page — connect, run the export, show progress and record count, save to a local file (browser download, no upload endpoint), surface CRC/length failures in a visible log | **Done.** The framing/CBOR/CRC16/CRC32/ring-walk port was extracted and run under Node against the same vectors as `tests/host/test_survey_smp.py` and `test_survey_export.py` (CRC16-XMODEM and CRC32 known vectors, multi-frame packet round trips, CBOR uint-width round trips including ≥2³², a two-file ring-buffer walk with per-file download caching) — all passing. Pre-commit review found and fixed two UI-state bugs (Disconnect left enabled during an in-flight export, racing the transport's pending read/write; button state not reset when the post-connect record-count read fails) and hardened the CBOR 8-byte-width decode path against silent 32-bit truncation (unreachable today, but wrong-not-erroring is worse than throwing). No "clear" control exists on the page. Opened in real Chrome via chrome-devtools MCP against the connected device: page loads with no console errors of its own, and the `#unsupported` Web-Serial-not-available branch correctly stays hidden (Chrome supports it). Clicking Connect correctly invokes the real `navigator.serial.requestPort()` and opens the OS-native device chooser — which is what real-browser testing caught and Node testing structurally could not: with no filter, that chooser listed every serial-capable device on the machine, including Bluetooth-serial peripherals (AirPods, a mouse), not just the Thingy:91 X. Fixed with a `usbVendorId: 0x1915` (Nordic Semiconductor, confirmed via `ioreg -p IOUSB -l` against the connected device) filter on `requestPort()`. Storage capacity — record count against `RECORDS_PER_TYPE` (25,000, mirroring the firmware's `CONFIG_APP_STORAGE_MAX_RECORDS_PER_TYPE`) — is now shown on connect (`"5083 / 25000 slots used (20.3%)"`) and flagged in red past 90%, since FW-6's default `APP_STORAGE_FULL_STOP` means a full partition silently stops recording rather than wrapping the oldest data — an operator sending the device out for a trip needs that visible before leaving, not discovered afterward as a gap in the data. No time-to-full estimate: the capture interval is runtime-settable (FW-7's `survey interval`), so this page has no fixed cadence to project from without a new device read. | **Done.** Full export completed end-to-end through the real browser UI against the connected device: page reported "Connected. 5083 record(s) stored," Start Export ran to "Done: 5083/5083 record(s) exported to `survey_export_2026-08-15T05-45-12-998Z.bin`," 0 failed, 0 console errors. (The OS-level device-chooser sheet itself is outside what chrome-devtools MCP can drive, so a human click selected the device; everything from Connect onward — the record-count read, the export loop, and the download — ran unassisted and was observed by the tooling.) The downloaded 659,098-byte file was independently re-verified against `scripts/survey_decode.py`: decodes cleanly, `records in: 5083`, `decode_error: 0`. Of those, the default quality gate (`require_bracket=True`) passed only 40 through, dropping 5043 for `missing_bracket` (no paired before/after GNSS fix) and 14 for `uptime_timebase` — expected on this dataset (a `--allow-missing-bracket`/scan-only pass recovers the rest) and a GNSS-bracket-completion-rate question for the field data itself, not a defect in the export or decode path. |
-| **CP10** ⚠️ partial | FW-7 cadence, FW-9 LEDs, FW-10 hygiene | `tests/module/survey_capture` passes with the cadence timer linked in (`CADENCE_AUTOSTART` compiled out so the suite's own assertions aren't raced by a real timer firing mid-test); no dedicated reschedule-maths test yet. Survey build FLASH 71.63–71.66 % / RAM 87.97 %, default build unchanged at 68.97 % / 82.47 % (confirms the LED gating is inert outside survey mode). | **Not yet run on target.** FW-7 (auto-capture, runtime-settable interval) and FW-9's 2-state green/red LED are implemented and build-verified but not hardware-verified; the LED model is 2 states, not the 5 FW-9 specifies (no searching/GNSS-poor/storage-full signal) — see FW-9 above. FW-10 hygiene not started. |
+| **CP10** ⚠️ partial | FW-7 cadence, FW-9 LEDs, FW-10 hygiene | `tests/module/survey_capture` passes with the cadence timer linked in (`CADENCE_AUTOSTART` compiled out so the suite's own assertions aren't raced by a real timer firing mid-test); no dedicated reschedule-maths test yet. `tests/module/survey_store` passes both full-behaviour configurations, now including `survey_store_is_full()` coverage, plus `tests/module/storage/littlefs_backend` (re-verified after the header-file mutex fix below). Survey build FLASH 72.95 % / RAM 91.99 %, default build unchanged at 68.97 % / 82.47 % (confirms the LED gating is inert outside survey mode). | **Not yet run on target.** FW-7 (auto-capture, runtime-settable interval) and FW-9's 5-state LED model are implemented and build-verified but not hardware-verified — see FW-9 above for the color/pattern scheme, the header-file race pre-commit review caught and its fix, and why no `led` module change was needed. FW-10 hygiene not started. RAM headroom is getting tight (91.99 % on the survey build) and is worth watching on future additions. |
 
 **Note on CP4 — why the golden files are generated, not hand-written.** The first decoder was written
 from the CDDL and disagreed with the firmware on `time-base`: the schema documented `0 = Unix epoch,

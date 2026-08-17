@@ -369,24 +369,79 @@ static bool run_step(enum location_msg_type type, uint32_t wanted, k_timeout_t t
 }
 
 /* FW-9: an operator with no console has exactly the LED to tell whether the device is
- * working. Two states, not five -- see REQUIREMENTS.md's FW-9 note on what CP10 actually
- * shipped versus what it specifies. Green latches on the cycle that stored something; red
- * latches on the cycle that did not, and clears itself the moment a later cycle succeeds.
- * -1 repetitions so the pattern holds until the next cycle overwrites it, rather than
- * going dark and reading as "device is off" a couple of seconds after a capture completes.
+ * working. Five states, latched until the next publish overwrites them (repetitions = -1),
+ * so the pattern never goes dark and reads as "device is off" between cycles:
+ *
+ *  - SEARCHING latches for the duration of a cycle, so a hang mid-cycle is visible as
+ *    "still searching" rather than looking identical to the previous cycle's result.
+ *  - CAPTURE_OK latches when a cycle stored a record with at least one real GNSS fix --
+ *    the record can be interpolated against ground truth, which is the point of the survey.
+ *  - GNSS_POOR latches when a cycle stored a record, but neither bracket produced a fix.
+ *    The radio observation is still saved (see survey_store_publish_record's -EINVAL
+ *    rationale), but the operator should know positioning is degraded, e.g. move to open
+ *    sky.
+ *  - STORAGE_FULL latches when the survey storage type is at capacity under
+ *    APP_STORAGE_FULL_STOP, so further records are being silently dropped -- see
+ *    survey_store_is_full()'s doc comment for why this can only be caught proactively.
+ *    Checked ahead of GNSS_POOR/CAPTURE_OK: an operator who can only see one color needs to
+ *    know recording has stopped before they need to know fix quality.
+ *  - ERROR latches when a cycle produced nothing to store (every step failed) or the store
+ *    itself failed for a reason other than being full.
+ *
+ * Colors are the existing dim (~55/255) palette, chosen so no two states share a hue:
+ * blue/green/amber/magenta/red.
  */
+enum survey_led_state {
+	SURVEY_LED_SEARCHING,
+	SURVEY_LED_CAPTURE_OK,
+	SURVEY_LED_GNSS_POOR,
+	SURVEY_LED_STORAGE_FULL,
+	SURVEY_LED_ERROR,
+};
+
 #if defined(CONFIG_APP_LED)
-static void survey_led_signal(bool ok)
+static void survey_led_signal(enum survey_led_state state)
 {
 	struct led_msg led_msg = {
 		.type = LED_RGB_SET,
-		.red = ok ? 0 : 55,
-		.green = ok ? 55 : 0,
-		.blue = 0,
-		.duration_on_msec = 250,
-		.duration_off_msec = 2000,
 		.repetitions = -1,
 	};
+
+	switch (state) {
+	case SURVEY_LED_SEARCHING:
+		led_msg.blue = 55;
+		led_msg.duration_on_msec = 250;
+		led_msg.duration_off_msec = 250;
+		break;
+	case SURVEY_LED_CAPTURE_OK:
+		led_msg.green = 55;
+		led_msg.duration_on_msec = 250;
+		led_msg.duration_off_msec = 2000;
+		break;
+	case SURVEY_LED_GNSS_POOR:
+		/* Green raised close to red (rather than a duller ~25) so this reads as amber,
+		 * not "dim red" -- easy to mistake for ERROR at a glance through a windshield,
+		 * even though the two also differ in blink rate (slow here vs. fast for ERROR).
+		 */
+		led_msg.red = 55;
+		led_msg.green = 45;
+		led_msg.duration_on_msec = 250;
+		led_msg.duration_off_msec = 2000;
+		break;
+	case SURVEY_LED_STORAGE_FULL:
+		led_msg.red = 55;
+		led_msg.blue = 55;
+		led_msg.duration_on_msec = 250;
+		led_msg.duration_off_msec = 2000;
+		break;
+	case SURVEY_LED_ERROR:
+	default:
+		led_msg.red = 55;
+		led_msg.duration_on_msec = 250;
+		led_msg.duration_off_msec = 250;
+		break;
+	}
+
 	int err = zbus_chan_pub(&led_chan, &led_msg, K_MSEC(100));
 
 	if (err) {
@@ -394,9 +449,9 @@ static void survey_led_signal(bool ok)
 	}
 }
 #else
-static inline void survey_led_signal(bool ok)
+static inline void survey_led_signal(enum survey_led_state state)
 {
-	ARG_UNUSED(ok);
+	ARG_UNUSED(state);
 }
 #endif /* CONFIG_APP_LED */
 
@@ -412,6 +467,7 @@ static void capture_cycle(enum survey_profile profile, int wdt_id)
 	int err;
 
 	cycle_started_uptime_ms = k_uptime_get();
+	survey_led_signal(SURVEY_LED_SEARCHING);
 
 	memset(&cycle_record, 0, sizeof(cycle_record));
 	cycle_record.sequence = timing.sequence;
@@ -519,19 +575,27 @@ static void capture_cycle(enum survey_profile profile, int wdt_id)
 	if (!cycle_record.scan_valid && !cycle_record.gnss_before_valid &&
 	    !cycle_record.gnss_after_valid) {
 		LOG_WRN("Cycle %u produced nothing; not stored", cycle_record.sequence);
-		survey_led_signal(false);
+		survey_led_signal(SURVEY_LED_ERROR);
 	} else {
 		err = survey_store_publish_record(&cycle_record);
 		if (err) {
 			LOG_WRN("Cycle %u not stored: %d", cycle_record.sequence, err);
-			survey_led_signal(false);
+			survey_led_signal(survey_store_is_full() ? SURVEY_LED_STORAGE_FULL :
+								    SURVEY_LED_ERROR);
 		} else {
 			LOG_INF("Cycle %u stored: gnss %s/%s, scan %s",
 				cycle_record.sequence,
 				cycle_record.gnss_before_valid ? "ok" : "--",
 				cycle_record.gnss_after_valid ? "ok" : "--",
 				cycle_record.scan_valid ? "ok" : "--");
-			survey_led_signal(true);
+			if (survey_store_is_full()) {
+				survey_led_signal(SURVEY_LED_STORAGE_FULL);
+			} else if (cycle_record.gnss_before_valid ||
+				   cycle_record.gnss_after_valid) {
+				survey_led_signal(SURVEY_LED_CAPTURE_OK);
+			} else {
+				survey_led_signal(SURVEY_LED_GNSS_POOR);
+			}
 		}
 	}
 

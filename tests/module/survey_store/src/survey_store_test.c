@@ -422,6 +422,34 @@ void test_filling_to_capacity_stores_every_record(void)
 		TEST_IGNORE_MESSAGE("FULL_STOP build; asserted in .overwrite");		\
 	}
 
+/* FW-9's storage-full LED state reads this instead of a store's return value, because a
+ * store's failure is reported only to the storage thread's own log -- see
+ * survey_store_is_full()'s doc comment in survey_store.h. Both full-behaviours are covered
+ * because the two must disagree: STOP has a real "full" to report, OVERWRITE never does.
+ */
+void test_survey_store_is_full_reports_capacity_under_stop(void)
+{
+	REQUIRE_FULL_STOP();
+
+	TEST_ASSERT_FALSE(survey_store_is_full());
+
+	store_records(0, MAX_RECORDS - 1);
+	TEST_ASSERT_FALSE(survey_store_is_full());
+
+	store_records(MAX_RECORDS - 1, 1);
+	TEST_ASSERT_TRUE(survey_store_is_full());
+}
+
+void test_survey_store_is_full_never_reports_full_under_overwrite(void)
+{
+	REQUIRE_FULL_OVERWRITE();
+
+	store_records(0, MAX_RECORDS);
+	store_records(MAX_RECORDS, 5);
+
+	TEST_ASSERT_FALSE(survey_store_is_full());
+}
+
 /* The survey configuration. Once full, the device keeps what it has: the beginning of a
  * drive is the part that was hardest to collect, and losing it silently is the failure
  * this choice exists to prevent.

@@ -40,6 +40,14 @@ struct lfs_type_state {
 
 static struct lfs_type_state type_state[CONFIG_APP_STORAGE_MAX_TYPES];
 
+/* Guards the seek+read/seek+write+sync pairs on the shared, permanently-open header_file
+ * handles above. All backend entry points run on the storage module's own thread except
+ * count(), which survey_store_is_full() also calls from the survey capture thread to check
+ * capacity without waiting on a store roundtrip -- without this lock, that cross-thread read
+ * can interleave with a concurrent header write and observe a torn/inconsistent header.
+ */
+static K_MUTEX_DEFINE(header_file_lock);
+
 /* Block size cached from fs_statvfs() during init. The value is a hardware property of the flash
  * and is therefore constant, so caching it avoids repeated fs_statvfs() calls and calculations
  * in the hot path.
@@ -249,14 +257,20 @@ static int read_storage_file_header(const struct storage_data *type,
 	__ASSERT(type_state[idx].header_open,
 		 "Header file not open for type %s", type->name);
 
+	k_mutex_lock(&header_file_lock, K_FOREVER);
+
 	ret = fs_seek(&type_state[idx].header_file, 0, FS_SEEK_SET);
 	if (ret < 0) {
 		LOG_ERR("Failed to seek header file for %s: %d", type->name, ret);
+		k_mutex_unlock(&header_file_lock);
 
 		return ret;
 	}
 
 	ret = (int)fs_read(&type_state[idx].header_file, header, sizeof(*header));
+
+	k_mutex_unlock(&header_file_lock);
+
 	if (ret < 0) {
 		LOG_ERR("Failed to read header file for %s: %d", type->name, ret);
 
@@ -290,9 +304,12 @@ static int write_storage_file_header(const struct storage_data *type,
 	__ASSERT(type_state[idx].header_open,
 		 "Header file not open for type %s", type->name);
 
+	k_mutex_lock(&header_file_lock, K_FOREVER);
+
 	ret = fs_seek(&type_state[idx].header_file, 0, FS_SEEK_SET);
 	if (ret < 0) {
 		LOG_ERR("Failed to seek header file for %s: %d", type->name, ret);
+		k_mutex_unlock(&header_file_lock);
 
 		return ret;
 	}
@@ -300,11 +317,15 @@ static int write_storage_file_header(const struct storage_data *type,
 	ret = (int)fs_write(&type_state[idx].header_file, header, sizeof(*header));
 	if (ret < 0) {
 		LOG_ERR("Failed to write header file for %s: %d", type->name, ret);
+		k_mutex_unlock(&header_file_lock);
 
 		return ret;
 	}
 
 	ret = fs_sync(&type_state[idx].header_file);
+
+	k_mutex_unlock(&header_file_lock);
+
 	if (ret < 0) {
 		LOG_ERR("Failed to sync header file for %s: %d", type->name, ret);
 

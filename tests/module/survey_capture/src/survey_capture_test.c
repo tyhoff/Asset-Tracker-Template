@@ -122,6 +122,17 @@ uint32_t survey_store_next_sequence(void)
 	return stub_sequence++;
 }
 
+/* FW-9: fixed rather than driven by a fake backend. What is under test in this suite is
+ * step sequencing, not the storage-full LED path -- see the storage-full LED coverage in
+ * the survey_store suite instead, which stubs the backend it actually needs.
+ */
+static bool stub_storage_full;
+
+bool survey_store_is_full(void)
+{
+	return stub_storage_full;
+}
+
 /* --- Stubs for the rest of the survey module ------------------------------------------ */
 
 /* The cache the orchestrator snapshots after each step. The fake fills it in the same

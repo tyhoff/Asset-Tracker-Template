@@ -41,6 +41,7 @@
  * context with staging_lock held, and that is a different and much worse proposition.
  */
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include <zephyr/zbus/zbus.h>
@@ -159,6 +160,28 @@ int survey_store_publish_record(const struct survey_record_data *record);
  * Safe from any thread.
  */
 uint32_t survey_store_next_sequence(void);
+
+/** @brief Report whether the survey storage type is at capacity.
+ *
+ * Synchronous and proactive: it asks the backend's current record count rather than
+ * waiting to see a store fail. That matters because @ref survey_store_publish_record only
+ * reports whether the record reached the storage module's queue, not whether the
+ * asynchronous write to flash that follows actually succeeded -- see storage.c's
+ * handle_data_message(), which logs a failed backend store but does not propagate it.
+ * Checking capacity here is the only way a caller finds out before that write is attempted.
+ *
+ * Always false under APP_STORAGE_FULL_OVERWRITE, which never stops accepting records.
+ * Meaningful only under APP_STORAGE_FULL_STOP, where hitting capacity means further
+ * records are silently dropped -- the condition FW-9's storage-full LED state exists to
+ * surface.
+ *
+ * Safe from any thread: it does not take staging_lock, and unlike every other caller of
+ * storage_backend_get(), it runs on the survey capture thread rather than storage's own
+ * thread. The header-file access this ends up doing inside the LittleFS backend is guarded
+ * by a mutex in littlefs_backend.c specifically so this cross-thread call cannot interleave
+ * with a concurrent header write from storage.c's own thread.
+ */
+bool survey_store_is_full(void);
 
 #ifdef __cplusplus
 }
