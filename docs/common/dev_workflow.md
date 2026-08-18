@@ -508,6 +508,69 @@ itself, check file count and `fs ls` latency first: an A/B test that shows the t
 new firmware builds against a full partition, but not against a cleared one, is a fast way to rule the
 code out.
 
+### The fs_mgmt access hook has to allow the checksum group too, not just download
+
+`survey_export_file_access()` (`app/src/modules/survey/survey_export.c`) is a deny-by-default MCUmgr
+callback: only `access->access == FS_MGMT_FILE_ACCESS_READ` under `/att_storage` was allowed. That
+looked complete because a plain `fs download` worked fine on target. It was not: `verified_download()`
+in both `scripts/survey_export.py` and `web/export.html` also calls `fs checksum <path>` (CRC32) to
+confirm the download before trusting it, and Zephyr's `fs_mgmt_file_hash_checksum()` tags that request
+with a *different* access type, `FS_MGMT_FILE_ACCESS_HASH_CHECKSUM` (`fs_mgmt.c`). The hook denied it
+unconditionally, so every CRC-verified export — CLI and browser, any file — failed with `device
+returned rc=11` (`MGMT_ERR_EACCESSDENIED`), even though the plain download that preceded it always
+succeeded. This is easy to miss because `--stats-only` and the session-header read (`read_session()`,
+deliberately not CRC-verified) never call `checksum_crc32()`, so a quick smoke test looks fine; only a
+full `verified_download()` pass exercises the denied path. Fix: also allow
+`FS_MGMT_FILE_ACCESS_HASH_CHECKSUM` under `/att_storage` in the same condition. `FS_MGMT_FILE_ACCESS_STATUS`
+(`fs stat`) remains denied — grepped both export clients and confirmed `.stat()` is never called in
+the real export flow, so there is nothing exercising that gap today.
+
+### A partition mixing old- and new-format files breaks the export tools' fixed file-size assumption
+
+`survey_export.py`'s `ENTRIES_PER_FILE` (and `web/export.html`'s copy) assumes every `SURVEY_N.bin` file
+holds the same number of records, computed from the current `CONFIG_APP_STORAGE_LITTLEFS_TARGET_FILE_SIZE`.
+That assumption breaks on a dev partition that still has files written under an older config (e.g. the
+pre-fix one-block-per-file layout) sitting alongside newly-written files under the current one: the
+export walks past the end of the smaller old-format files using the new, larger stride, and reads
+garbage offsets — surfaces as `slot declares length 0, which does not fit a 816-byte slot` or `slot is 0
+bytes, too short to carry a length prefix` for large blocks of consecutive ring indices. Not a firmware
+defect — a real device that has never had its `TARGET_FILE_SIZE` changed under it will never see mixed
+layouts. On a bench unit that has been reflashed across firmware revisions, `att_storage clear` (not
+`survey clear`, which only resets the in-RAM observation cache — see below) before a from-scratch
+export test avoids this.
+
+### `survey clear` and `att_storage clear` are different commands, and it is easy to reach for the wrong one
+
+`survey clear` (`survey_shell.c`) discards the cached in-progress observation, not stored records —
+running it does not touch the LittleFS partition at all. The command that wipes stored data is
+`att_storage clear` (`storage_shell.c`, publishes `STORAGE_CLEAR`), documented above under "Wiping the
+LittleFS partition." Confusing the two looks like a no-op: `survey clear` prints "Observation cache
+cleared," succeeds, and the record count on the next `att_storage stats` or export is unchanged.
+
+### The raw SMP/export transport is the second `/dev/cu.usbmodem*` port, not the shell console
+
+On this survey-export build, `overlay-survey-export.overlay` routes `uart-mcumgr` to `uart1` specifically
+so SMP frames do not interleave with shell log output on `uart0`. In practice this means the two CDC
+ports enumerate as, e.g., `/dev/cu.usbmodem1102` (shell console, `vcom: 0`) and `/dev/cu.usbmodem1105`
+(dedicated export transport, `vcom: 1`) — `survey_console.py`/interactive shell use the first, and
+`survey_export.py --port ... --baud 1000000` and `web/export.html`'s "Dedicated export port" option need
+the second. Pointing the export tooling at the console port produces `SmpError: timed out waiting for a
+response to group 8 command 0`, not a clearer "wrong port" error, since the console shell simply never
+answers an SMP frame.
+
+### `west build -p always` has to come before `--`, not after
+
+```sh
+# Wrong -- CMake sees `-p` and fails with "Unknown argument -p"
+west build ... -- -DEXTRA_CONF_FILE=... -p always
+
+# Right -- `-p` is a west build option, not a CMake/EXTRA_CONF_FILE one
+west build ... -p always -- -DEXTRA_CONF_FILE=...
+```
+
+Everything after `--` is passed through to CMake as cache variables; `west build`'s own flags (`-p`,
+`-b`, `-d`, `--sysbuild`) must come before it.
+
 ## Unit tests
 
 native_sim is Linux-only — Zephyr's POSIX arch refuses to configure on macOS with "The POSIX
