@@ -14,9 +14,9 @@
  * recovery in survey_store.c both trust without validating. This file is the only thing
  * standing between that and a corrupted partition.
  *
- * The policy is deliberately simple and denies by default: any access type other than a
- * read (upload, hash/checksum, even a status query) is rejected outright, and a read is
- * allowed only under /att_storage. There is no case in the collection workflow -- the
+ * The policy is deliberately simple and denies by default: only a read or a checksum/hash
+ * request is allowed, and only under /att_storage -- everything else (upload, a status
+ * query) is rejected outright. There is no case in the collection workflow -- the
  * technical fallback script or the non-technical browser page -- that needs anything else.
  * "survey clear" already exists as a shell command for the one legitimate write this
  * partition needs, gated to a console session rather than exposed over the export
@@ -87,7 +87,9 @@ static enum mgmt_cb_return survey_export_file_access(uint32_t event,
 		return MGMT_CB_OK;
 	}
 
-	if (access->access == FS_MGMT_FILE_ACCESS_READ && path_under_mount(access->filename)) {
+	if ((access->access == FS_MGMT_FILE_ACCESS_READ ||
+	     access->access == FS_MGMT_FILE_ACCESS_HASH_CHECKSUM) &&
+	    path_under_mount(access->filename)) {
 		return MGMT_CB_OK;
 	}
 

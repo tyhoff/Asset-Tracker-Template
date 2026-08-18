@@ -137,10 +137,7 @@ def read_session(fs: FsMgmt) -> Optional[bytes]:
 
     Deliberately not CRC-verified like verified_download(): the session file is a single
     small chunk (well under one fs_mgmt transfer), not a multi-chunk transfer with a real
-    partial-write corruption risk, and this device's fs_mgmt checksum/hash group returns
-    rc=11 for this file specifically even when the plain download is correct -- verified on
-    hardware by comparing a checksum-rejected download against the firmware's own boot-log
-    line for the same session.
+    partial-write corruption risk worth the extra round trip.
     """
     try:
         return fs.download(SESSION_PATH)

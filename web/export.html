@@ -630,9 +630,7 @@ async function verifiedDownload(fs, path) {
 // Absent is normal (no boot has stored a record yet), not an error -- matches
 // scripts/survey_export.py's read_session(). Deliberately not CRC-verified via
 // verifiedDownload(): a single small chunk well under one fs_mgmt transfer has no
-// partial-write corruption risk, and this device's checksum/hash group returns rc=11 for
-// this file specifically even when the plain download is correct (verified on hardware
-// against the firmware's own boot-log line for the same session).
+// partial-write corruption risk worth the extra round trip.
 async function readSession(fs) {
   try {
     return await fs.download(SESSION_PATH);
